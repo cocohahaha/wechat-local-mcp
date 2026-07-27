@@ -74,7 +74,7 @@ uv run --python /opt/homebrew/bin/python3.12 python scripts/capture_keys.py \
 zsh scripts/prepare_capture_copy.sh
 ```
 
-退出日常微信后，用 `--spawn "$HOME/Applications/WeChatKeyCapture.app/Contents/MacOS/WeChat"` 运行捕获脚本。脚本会在微信启动时安装只读派生函数观察器；当前版本通常无需再次扫码。脚本不会替你修改系统设置，也不会对日常使用的 `/Applications/WeChat.app` 重签名。
+退出日常微信后，用 `--spawn "$HOME/Library/Application Support/wechat-local-mcp/WeChatKeyCapture.app/Contents/MacOS/WeChat"` 运行捕获脚本。脚本会在微信启动时安装只读派生函数观察器；当前版本通常无需再次扫码。辅助副本放在应用支持目录中，避免被 macOS 当作第二个日常微信注册；脚本不会替你修改系统设置，也不会对日常使用的 `/Applications/WeChat.app` 重签名。
 
 > 密钥捕获是一次性环境准备，当前微信版本或下次升级后可能需要重新做。不要把 `keys.json`、明文数据库或聊天导出文件提交到 Git。
 
