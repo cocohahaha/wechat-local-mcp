@@ -1,18 +1,27 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Annotated, Any
+
+from mcp.types import CallToolResult, TextContent
 
 
-def output(data: Any, response_format: str = "markdown") -> Any:
+JsonToolResult = Annotated[CallToolResult, dict[str, Any]]
+
+
+def output(data: Any, response_format: str = "json") -> JsonToolResult:
     if response_format not in {"markdown", "json"}:
         raise ValueError("response_format must be 'markdown' or 'json'")
-    if response_format == "json":
-        # FastMCP turns a returned mapping into structuredContent and a
-        # machine-readable text block. Returning a raw mapping avoids nesting
-        # an MCP result inside another MCP result.
-        return data
-    return markdown(data)
+    structured = data if isinstance(data, dict) else {"result": data}
+    text = (
+        json.dumps(structured, ensure_ascii=False, indent=2, default=str)
+        if response_format == "json"
+        else markdown(structured)
+    )
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structuredContent=structured,
+    )
 
 
 def markdown(data: Any) -> str:

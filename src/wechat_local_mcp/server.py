@@ -4,13 +4,12 @@ import argparse
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from .config import account_dir, decrypted_dir, keys_file, load_keys, paths, status
 from .crypto import sync_databases
-from .formatting import output
+from .formatting import JsonToolResult, output
 from .store import ChatStore
 
 
@@ -44,7 +43,7 @@ def _store() -> ChatStore:
     description="只读检查微信版本、加密数据库、密钥文件和明文聊天快照是否就绪。不会读取或返回聊天正文。",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-def wechat_status() -> dict[str, Any]:
+def wechat_status() -> JsonToolResult:
     return output(status(), "json")
 
 
@@ -54,7 +53,7 @@ def wechat_status() -> dict[str, Any]:
     description="使用 macOS 截图和本机 Vision OCR 诊断微信主窗口是否可读。仅在安装 ui 可选依赖并授予屏幕录制权限后使用；不会发送、输入或保存截图。",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-def wechat_ui_diagnose() -> dict[str, Any]:
+def wechat_ui_diagnose() -> JsonToolResult:
     try:
         from .macos import diagnose
         return output(diagnose(), "json")
@@ -68,7 +67,7 @@ def wechat_ui_diagnose() -> dict[str, Any]:
     description="当明文数据库快照还未准备好时，用本机 OCR 读取当前微信窗口左侧可见的最近会话。不会修改界面内容以外的任何数据。",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-def wechat_list_recent_chats(limit: int = 20, response_format: str = "markdown") -> dict[str, Any]:
+def wechat_list_recent_chats(limit: int = 20, response_format: str = "json") -> JsonToolResult:
     if not 1 <= limit <= 100:
         raise ValueError("limit must be 1-100")
     try:
@@ -85,7 +84,7 @@ def wechat_list_recent_chats(limit: int = 20, response_format: str = "markdown")
     description="用 OCR 打开指定聊天并读取最近可见/可滚动的消息。它是数据库快照不可用时的只读兜底，消息可能缺少精确时间戳和发送者识别。",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
-def wechat_read_chat_ui(chat: str, limit: int = 50, scroll_pages: int = 3, response_format: str = "markdown") -> dict[str, Any]:
+def wechat_read_chat_ui(chat: str, limit: int = 50, scroll_pages: int = 3, response_format: str = "json") -> JsonToolResult:
     if not 1 <= limit <= 300 or not 0 <= scroll_pages <= 20:
         raise ValueError("limit must be 1-300 and scroll_pages must be 0-20")
     try:
@@ -102,7 +101,7 @@ def wechat_read_chat_ui(chat: str, limit: int = 50, scroll_pages: int = 3, respo
     description="对 OCR 读取到的当前聊天消息运行本地启发式待办提取；结果需要人工确认，不会写入任务系统。",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-def wechat_find_todos_ui(chat: str, limit: int = 80, scroll_pages: int = 3, min_score: float = 1.5, response_format: str = "markdown") -> dict[str, Any]:
+def wechat_find_todos_ui(chat: str, limit: int = 80, scroll_pages: int = 3, min_score: float = 1.5, response_format: str = "json") -> JsonToolResult:
     if not 1 <= limit <= 300 or not 0 <= scroll_pages <= 20 or not 0 <= min_score <= 10:
         raise ValueError("limit must be 1-300, scroll_pages 0-20, min_score 0-10")
     try:
@@ -121,7 +120,7 @@ def wechat_find_todos_ui(chat: str, limit: int = 80, scroll_pages: int = 3, min_
     description="将本机微信 db_storage 中有对应 64 位十六进制密钥的数据库，解密到独立的本地只读快照目录。不会修改微信源文件、不会发送消息。建议退出微信后执行。",
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-def wechat_sync(key_file: str | None = None, output_dir: str | None = None) -> dict[str, Any]:
+def wechat_sync(key_file: str | None = None, output_dir: str | None = None) -> JsonToolResult:
     p = paths()
     account = account_dir(p.container)
     if account is None:
@@ -147,7 +146,7 @@ def wechat_sync(key_file: str | None = None, output_dir: str | None = None) -> d
     description="列出明文快照中的联系人和群聊，支持关键词与 offset/limit 分页。",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-def wechat_list_chats(query: str = "", limit: int = 50, offset: int = 0, response_format: str = "markdown") -> dict[str, Any]:
+def wechat_list_chats(query: str = "", limit: int = 50, offset: int = 0, response_format: str = "json") -> JsonToolResult:
     if not 1 <= limit <= 200 or offset < 0:
         raise ValueError("limit must be 1-200 and offset must be >= 0")
     try:
@@ -167,7 +166,7 @@ def wechat_list_chats(query: str = "", limit: int = 50, offset: int = 0, respons
     description="按联系人昵称、备注、群名或微信 ID 读取消息；可用 ISO-8601 时间范围和 limit 限制结果。",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-def wechat_read_chat(chat: str, start_time: str | None = None, end_time: str | None = None, limit: int = 200, response_format: str = "markdown") -> dict[str, Any]:
+def wechat_read_chat(chat: str, start_time: str | None = None, end_time: str | None = None, limit: int = 200, response_format: str = "json") -> JsonToolResult:
     if not 1 <= limit <= 5000:
         raise ValueError("limit must be 1-5000")
     try:
@@ -187,7 +186,7 @@ def wechat_read_chat(chat: str, start_time: str | None = None, end_time: str | N
     description="在全部聊天或指定聊天中搜索文本消息，支持时间范围、offset/limit 和 JSON/Markdown 输出。",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-def wechat_search_messages(query: str, chats: list[str] | None = None, start_time: str | None = None, end_time: str | None = None, limit: int = 50, offset: int = 0, response_format: str = "markdown") -> dict[str, Any]:
+def wechat_search_messages(query: str, chats: list[str] | None = None, start_time: str | None = None, end_time: str | None = None, limit: int = 50, offset: int = 0, response_format: str = "json") -> JsonToolResult:
     if not 1 <= limit <= 500 or offset < 0:
         raise ValueError("limit must be 1-500 and offset must be >= 0")
     return output(_store().search(query, chats, _ts(start_time), _ts(end_time), limit, offset), response_format)
@@ -199,7 +198,7 @@ def wechat_search_messages(query: str, chats: list[str] | None = None, start_tim
     description="从指定聊天或全部聊天中按时间倒序返回最近消息。",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-def wechat_recent_messages(chats: list[str] | None = None, limit: int = 50, response_format: str = "markdown") -> dict[str, Any]:
+def wechat_recent_messages(chats: list[str] | None = None, limit: int = 50, response_format: str = "json") -> JsonToolResult:
     if not 1 <= limit <= 500:
         raise ValueError("limit must be 1-500")
     return output(_store().recent(chats, limit), response_format)
@@ -211,7 +210,7 @@ def wechat_recent_messages(chats: list[str] | None = None, limit: int = 50, resp
     description="在最近 N 天的聊天文本中用可解释的中英文行动项启发式筛选待办候选；结果需要人工确认，不会自动创建任务或发送消息。",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-def wechat_find_todos(chats: list[str] | None = None, days: int = 30, limit: int = 100, response_format: str = "markdown") -> dict[str, Any]:
+def wechat_find_todos(chats: list[str] | None = None, days: int = 30, limit: int = 100, response_format: str = "json") -> JsonToolResult:
     if not 1 <= days <= 3650 or not 1 <= limit <= 500:
         raise ValueError("days must be 1-3650 and limit must be 1-500")
     return output(_store().todos(chats, days, limit), response_format)
@@ -223,7 +222,7 @@ def wechat_find_todos(chats: list[str] | None = None, days: int = 30, limit: int
     description="返回指定聊天的消息量、参与者、行动项候选和最近消息，供模型进一步生成摘要。",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-def wechat_chat_summary(chat: str, start_time: str | None = None, end_time: str | None = None, max_messages: int = 1000, response_format: str = "markdown") -> dict[str, Any]:
+def wechat_chat_summary(chat: str, start_time: str | None = None, end_time: str | None = None, max_messages: int = 1000, response_format: str = "json") -> JsonToolResult:
     if not 1 <= max_messages <= 5000:
         raise ValueError("max_messages must be 1-5000")
     data = _store().read_chat(chat, _ts(start_time), _ts(end_time), max_messages)

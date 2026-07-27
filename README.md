@@ -127,6 +127,15 @@ codex mcp add wechat-local -- \
   --transport stdio
 ```
 
+## 响应格式
+
+所有读取、搜索、汇总和待办工具默认使用 `response_format="json"`。响应同时包含：
+
+- JSON 文本内容，兼容只读取 MCP `content` 的客户端。
+- 原始对象形式的 `structuredContent`，方便支持结构化工具输出的客户端直接消费。
+
+如需适合人工阅读的文本，可以显式传入 `response_format="markdown"`；此时 `structuredContent` 仍会保留。
+
 ## 可用工具
 
 - `wechat_status`：检查微信版本、数据库、密钥与快照状态。
