@@ -160,3 +160,9 @@ uv run --python /opt/homebrew/bin/python3.12 wechat-local-sync status
 ```
 
 若没有明文快照，MCP 会返回下一步提示，不会把加密数据库误当成可读内容。
+
+## 许可证与声明
+
+本项目采用 [MIT License](LICENSE)。
+
+本项目是社区开发的非官方工具，与腾讯或微信团队无隶属或背书关系。“微信”和“WeChat”及相关标识属于其各自权利人。
