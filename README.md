@@ -78,6 +78,32 @@ zsh scripts/prepare_capture_copy.sh
 
 > 密钥捕获是一次性环境准备，当前微信版本或下次升级后可能需要重新做。不要把 `keys.json`、明文数据库或聊天导出文件提交到 Git。
 
+### 截图快捷键或录屏权限异常
+
+如果准备密钥后，微信的截图快捷键失效，或者系统设置中的“录屏与系统音频录制”权限反复丢失，常见原因是旧版脚本把辅助副本放在 `~/Applications`：辅助副本与正式微信使用同一个 Bundle ID，但签名不同，macOS 的 LaunchServices/TCC 可能把两者误认为同一个应用，导致快捷键打开错误副本，或把录屏权限绑定到辅助副本的签名。
+
+修复步骤：
+
+1. 完全退出正式微信和辅助副本。
+2. 把旧的 `~/Applications/WeChatKeyCapture.app` 移到 `$HOME/Library/Application Support/wechat-local-mcp/WeChatKeyCapture.app`，或重新运行 `scripts/prepare_capture_copy.sh`。
+3. 取消辅助副本的 LaunchServices 注册：
+
+   ```bash
+   LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+   "$LSREGISTER" -u "$HOME/Library/Application Support/wechat-local-mcp/WeChatKeyCapture.app"
+   ```
+
+4. 重置正式微信的录屏授权，然后重新打开正式微信：
+
+   ```bash
+   tccutil reset ScreenCapture com.tencent.xinWeChat
+   open -a /Applications/WeChat.app
+   ```
+
+5. 在系统设置的“隐私与安全性 → 录屏与系统音频录制”中重新允许微信，再测试微信截图快捷键。
+
+新版 `prepare_capture_copy.sh` 会默认把辅助副本放在应用支持目录，并在创建后主动取消其 LaunchServices 注册，避免再次抢占正式微信。辅助副本仍可通过其可执行文件的绝对路径启动，不影响密钥捕获。
+
 ## 解密本地快照
 
 建议先完全退出微信，再执行：
