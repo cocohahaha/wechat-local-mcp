@@ -2,21 +2,22 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 import ctypes
-from ctypes import wintypes
 import logging
-from pathlib import Path
 import tempfile
 import time
-from typing import Iterator
+from collections.abc import Iterator
+from contextlib import contextmanager
+from ctypes import wintypes
+from pathlib import Path
+from typing import ClassVar
 
-from PIL import Image, ImageGrab, ImageStat
 import win32api
 import win32con
 import win32gui
 import win32process
 import win32ui
+from PIL import Image, ImageGrab, ImageStat
 
 from .models import ChatMessage, ChatSummary, OcrBlock, WindowInfo
 from .parser import (
@@ -26,7 +27,6 @@ from .parser import (
     parse_visible_messages,
 )
 from .windows_ocr import recognize_text
-
 
 LOGGER = logging.getLogger(__name__)
 PROCESS_NAMES = {"weixin.exe", "wechat.exe"}
@@ -208,7 +208,7 @@ def _press_key(vk: int, *, control: bool = False) -> None:
 
 
 class _KeyboardInput(ctypes.Structure):
-    _fields_ = [
+    _fields_: ClassVar[list[tuple[str, object]]] = [
         ("wVk", wintypes.WORD),
         ("wScan", wintypes.WORD),
         ("dwFlags", wintypes.DWORD),
@@ -218,18 +218,21 @@ class _KeyboardInput(ctypes.Structure):
 
 
 class _InputUnion(ctypes.Union):
-    _fields_ = [("ki", _KeyboardInput)]
+    _fields_: ClassVar[list[tuple[str, object]]] = [("ki", _KeyboardInput)]
 
 
 class _Input(ctypes.Structure):
-    _anonymous_ = ("union",)
-    _fields_ = [("type", wintypes.DWORD), ("union", _InputUnion)]
+    _anonymous_: ClassVar[tuple[str, ...]] = ("union",)
+    _fields_: ClassVar[list[tuple[str, object]]] = [
+        ("type", wintypes.DWORD),
+        ("union", _InputUnion),
+    ]
 
 
 def _type_unicode(text: str) -> None:
     encoded = text.encode("utf-16-le")
     for index in range(0, len(encoded), 2):
-        code_unit = int.from_bytes(encoded[index:index + 2], "little")
+        code_unit = int.from_bytes(encoded[index : index + 2], "little")
         events = (_Input * 2)(
             _Input(
                 type=INPUT_KEYBOARD,

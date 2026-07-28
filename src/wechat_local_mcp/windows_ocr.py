@@ -7,8 +7,9 @@ on macOS/Linux for parser tests and source builds.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .models import OcrBlock
 

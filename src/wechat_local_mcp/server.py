@@ -7,12 +7,17 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from .config import account_dir, decrypted_dir, keys_file, load_keys, paths, status
+from .config import account_dir, decrypted_dir, load_keys, paths, status
 from .crypto import sync_databases
 from .formatting import JsonToolResult, output
-from .platform_ui import backend_name, diagnose, install_hint, list_recent_chats, read_chat
+from .platform_ui import (
+    backend_name,
+    diagnose,
+    install_hint,
+    list_recent_chats,
+    read_chat,
+)
 from .store import ChatStore
-
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
 logger = logging.getLogger("wechat-local-mcp")
