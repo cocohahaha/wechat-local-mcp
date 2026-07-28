@@ -3,14 +3,26 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 
-CONTAINER_DEFAULT = Path.home() / "Library/Containers/com.tencent.xinWeChat/Data/Documents"
-DECRYPTED_DEFAULT = Path.home() / "Library/Application Support/wechat-local-vault/decrypted/current"
-KEYS_DEFAULT = Path.home() / ".config/wechat-local-mcp/keys.json"
+if sys.platform == "win32":
+    CONTAINER_DEFAULT = Path.home() / "Documents"
+    DECRYPTED_DEFAULT = (
+        Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData/Local")))
+        / "wechat-local-vault/decrypted/current"
+    )
+    KEYS_DEFAULT = (
+        Path(os.environ.get("APPDATA", str(Path.home() / "AppData/Roaming")))
+        / "wechat-local-mcp/keys.json"
+    )
+else:
+    CONTAINER_DEFAULT = Path.home() / "Library/Containers/com.tencent.xinWeChat/Data/Documents"
+    DECRYPTED_DEFAULT = Path.home() / "Library/Application Support/wechat-local-vault/decrypted/current"
+    KEYS_DEFAULT = Path.home() / ".config/wechat-local-mcp/keys.json"
 LEGACY_KEYS_DEFAULT = Path.home() / ".config/wechat-keys.json"
 
 
@@ -41,7 +53,7 @@ def keys_file() -> Path:
 
 def account_dir(container: Path | None = None) -> Path | None:
     root = container or container_dir()
-    xwechat = root / "xwechat_files"
+    xwechat = root if root.name.casefold() == "xwechat_files" else root / "xwechat_files"
     if not xwechat.is_dir():
         return None
     candidates = [
@@ -59,6 +71,8 @@ def paths() -> Paths:
 
 
 def wechat_version() -> str | None:
+    if sys.platform != "darwin":
+        return None
     info = Path("/Applications/WeChat.app/Contents/Info.plist")
     if not info.exists():
         return None
@@ -87,6 +101,7 @@ def status() -> dict[str, Any]:
     encrypted = _db_inventory(p.account_dir)
     decrypted_files = sorted(p.decrypted_dir.rglob("*.db")) if p.decrypted_dir.is_dir() else []
     return {
+        "platform": sys.platform,
         "wechat_version": wechat_version(),
         "container_dir": str(p.container),
         "account_dir": str(p.account_dir) if p.account_dir else None,

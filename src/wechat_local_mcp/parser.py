@@ -1,4 +1,4 @@
-"""Turn Vision OCR blocks into chats, messages, and stable match keys."""
+"""Turn local OCR blocks into chats, messages, and stable match keys."""
 
 from __future__ import annotations
 

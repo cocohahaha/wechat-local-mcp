@@ -1,11 +1,12 @@
 # wechat-local-mcp
 
-一个只读的本地 MCP 服务，用来把你自己的 macOS 微信聊天变成可搜索、可提取待办的上下文。
+一个只读的本地 MCP 服务，用来把你自己的 macOS 或 Windows 微信聊天变成可搜索、可提取待办的上下文。
 
 它分成两层：
 
-1. 一次性准备层：从本机微信账号目录捕获每个数据库的 32 字节密钥，并把数据库解密成独立快照。
-2. MCP 查询层：只读取快照，不向微信发消息、不修改微信数据库、不联网。
+1. 精确历史层：把已获得密钥的本地数据库解密成独立快照，再进行全文搜索和待办提取。
+2. 跨版本 UI 层：在数据库适配失效或尚无密钥时，用 macOS Vision 或 Windows.Media.Ocr 读取当前微信窗口。
+3. MCP 查询层：默认返回 JSON，不向微信发消息、不修改微信数据库、不联网。
 
 这样微信升级时，只需要替换准备层；`wechat_list_chats`、`wechat_search_messages`、`wechat_find_todos` 等工具不需要跟着重写。
 
@@ -17,6 +18,8 @@
 
 较新的 macOS 微信可能为每个数据库使用独立密钥，旧版“一个 key 解所有库”的工具不能直接复用。微信升级后，数据库结构或密钥派生方式仍可能变化。工具不会覆盖 `/Applications/WeChat.app`，也不会对日常微信做重签名。
 
+Windows 微信 4.x 的账号数据通常位于“文档”目录下的 `xwechat_files`。如微信设置了自定义存储位置，可用 `WECHAT_CONTAINER_DIR` 指向 `xwechat_files` 本身或它的父目录。Windows 版优先提供不依赖数据库密钥的 UI/OCR 读取；已有明文快照仍可使用全部精确查询工具。
+
 ## 安全与隐私
 
 - 仓库不包含真实密钥、微信数据库、聊天导出、账号目录或本机虚拟环境。
@@ -26,6 +29,8 @@
 - `keys.json` 和明文快照默认保存在项目目录之外的用户配置目录中，并限制为仅当前系统账户可读；不要提交或分享它们。
 
 ## 安装
+
+### macOS
 
 在本目录执行：
 
@@ -38,6 +43,19 @@ uv sync --extra keys --extra ui --extra test --python /opt/homebrew/bin/python3.
 ```bash
 uv run --python /opt/homebrew/bin/python3.12 wechat-local-sync status
 ```
+
+### Windows 10/11
+
+安装 Python 3.11 或 3.12 与 [uv](https://docs.astral.sh/uv/)，然后在 PowerShell 中运行：
+
+```powershell
+uv sync --extra windows --extra test --python 3.12
+uv run wechat-local-mcp --transport stdio
+```
+
+也可以直接运行 `powershell -ExecutionPolicy Bypass -File scripts/install_windows.ps1` 完成依赖安装和离线测试。
+
+Windows UI 读取使用系统自带的 `Windows.Media.Ocr`，截图只存在于进程的临时目录，识别结束后自动删除，不调用云端 OCR。若诊断提示没有中文 OCR，请在“设置 → 时间和语言 → 语言和区域”中安装简体中文语言功能。
 
 ## 一次性准备密钥
 
@@ -153,6 +171,14 @@ codex mcp add wechat-local -- \
   --transport stdio
 ```
 
+Windows PowerShell 示例：
+
+```powershell
+codex mcp add wechat-local -- `
+  "$PWD\.venv\Scripts\wechat-local-mcp.exe" `
+  --transport stdio
+```
+
 ## 响应格式
 
 所有读取、搜索、汇总和待办工具默认使用 `response_format="json"`。响应同时包含：
@@ -179,7 +205,7 @@ codex mcp add wechat-local -- \
 
 所有查询工具都是只读的；`wechat_find_todos` 只返回候选，不会替你创建任务、发消息或修改微信。
 
-OCR 兜底需要：
+macOS OCR 兜底需要：
 
 ```bash
 uv sync --extra ui --python /opt/homebrew/bin/python3.12
@@ -187,11 +213,26 @@ uv sync --extra ui --python /opt/homebrew/bin/python3.12
 
 并在系统设置中允许运行 MCP 的终端使用“屏幕与系统音频录制”。OCR 是当前屏幕的近似读取，长期历史、精确 sender 和全文搜索仍以数据库快照后端为准。
 
+Windows OCR 兜底需要：
+
+```powershell
+uv sync --extra windows --python 3.12
+```
+
+支持新版 `Weixin.exe` 和旧版 `WeChat.exe`。调用读取工具时应保持微信已登录、主窗口未最小化；工具可能把微信切到前台、打开指定聊天并向上滚动，但不会在输入框发送内容。OCR 是当前窗口的近似读取，长期历史、精确 sender 和全文搜索仍以数据库快照后端为准。
+
 ## 验证
 
 ```bash
 uv run --python /opt/homebrew/bin/python3.12 pytest
 uv run --python /opt/homebrew/bin/python3.12 wechat-local-sync status
+```
+
+Windows：
+
+```powershell
+uv run pytest
+uv run wechat-local-sync status
 ```
 
 若没有明文快照，MCP 会返回下一步提示，不会把加密数据库误当成可读内容。

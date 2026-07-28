@@ -1,7 +1,7 @@
 [project]
 name = "wechat-local-mcp"
-version = "0.1.1"
-description = "Read-only MCP server for a user's local WeChat chat archive on macOS"
+version = "0.2.0"
+description = "Read-only MCP server for a user's local WeChat chats on macOS and Windows"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -16,9 +16,20 @@ dependencies = [
 keys = ["frida>=16.5.0"]
 test = ["pytest>=8.0.0"]
 ui = [
-  "pyobjc>=12.1",
-  "pyobjc-framework-applicationservices>=12.1",
-  "pillow>=10.0.0",
+  "pyobjc>=12.1; sys_platform == 'darwin'",
+  "pyobjc-framework-applicationservices>=12.1; sys_platform == 'darwin'",
+  "pillow>=10.0.0; sys_platform == 'darwin'",
+]
+windows = [
+  "pillow>=10.0.0; sys_platform == 'win32'",
+  "pywin32>=310; sys_platform == 'win32'",
+  "winrt-Windows.Foundation>=3.2.1,<4; sys_platform == 'win32'",
+  "winrt-Windows.Foundation.Collections>=3.2.1,<4; sys_platform == 'win32'",
+  "winrt-Windows.Globalization>=3.2.1,<4; sys_platform == 'win32'",
+  "winrt-Windows.Graphics.Imaging>=3.2.1,<4; sys_platform == 'win32'",
+  "winrt-Windows.Media.Ocr>=3.2.1,<4; sys_platform == 'win32'",
+  "winrt-Windows.Storage>=3.2.1,<4; sys_platform == 'win32'",
+  "winrt-Windows.Storage.Streams>=3.2.1,<4; sys_platform == 'win32'",
 ]
 
 [project.urls]

@@ -26,7 +26,7 @@ class StrictInput(BaseModel):
 
 
 class OcrBlock(BaseModel):
-    """One line recognized by the macOS Vision framework."""
+    """One line recognized by a local operating-system OCR engine."""
 
     text: str
     confidence: float = Field(ge=0.0, le=1.0)

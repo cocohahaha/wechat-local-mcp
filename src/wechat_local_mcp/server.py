@@ -10,6 +10,7 @@ from mcp.server.fastmcp import FastMCP
 from .config import account_dir, decrypted_dir, keys_file, load_keys, paths, status
 from .crypto import sync_databases
 from .formatting import JsonToolResult, output
+from .platform_ui import backend_name, diagnose, install_hint, list_recent_chats, read_chat
 from .store import ChatStore
 
 
@@ -50,15 +51,22 @@ def wechat_status() -> JsonToolResult:
 @mcp.tool(
     name="wechat_ui_diagnose",
     title="诊断微信 UI 只读兜底",
-    description="使用 macOS 截图和本机 Vision OCR 诊断微信主窗口是否可读。仅在安装 ui 可选依赖并授予屏幕录制权限后使用；不会发送、输入或保存截图。",
+    description="使用本机窗口捕获和系统 OCR 诊断微信主窗口是否可读。支持 macOS Vision 与 Windows.Media.Ocr；不会发送消息或保留截图。",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 def wechat_ui_diagnose() -> JsonToolResult:
     try:
-        from .macos import diagnose
         return output(diagnose(), "json")
     except Exception as exc:
-        return output({"ready": False, "error": str(exc), "next_step": "uv sync --extra ui，然后在系统设置中允许屏幕与系统音频录制。"}, "json")
+        return output(
+            {
+                "ready": False,
+                "error": str(exc),
+                "backend": backend_name(),
+                "next_step": install_hint(),
+            },
+            "json",
+        )
 
 
 @mcp.tool(
@@ -71,11 +79,16 @@ def wechat_list_recent_chats(limit: int = 20, response_format: str = "json") -> 
     if not 1 <= limit <= 100:
         raise ValueError("limit must be 1-100")
     try:
-        from .macos import list_recent_chats
         chats = [item.model_dump() for item in list_recent_chats(limit)]
-        return output({"count": len(chats), "items": chats, "backend": "macos_vision_ocr"}, response_format)
+        return output(
+            {"count": len(chats), "items": chats, "backend": backend_name()},
+            response_format,
+        )
     except Exception as exc:
-        return output({"ready": False, "error": str(exc), "backend": "macos_vision_ocr"}, "json")
+        return output(
+            {"ready": False, "error": str(exc), "backend": backend_name()},
+            "json",
+        )
 
 
 @mcp.tool(
@@ -88,11 +101,26 @@ def wechat_read_chat_ui(chat: str, limit: int = 50, scroll_pages: int = 3, respo
     if not 1 <= limit <= 300 or not 0 <= scroll_pages <= 20:
         raise ValueError("limit must be 1-300 and scroll_pages must be 0-20")
     try:
-        from .macos import read_chat
         messages = [item.model_dump() for item in read_chat(chat, limit=limit, scroll_pages=scroll_pages)]
-        return output({"chat": chat, "count": len(messages), "messages": messages, "backend": "macos_vision_ocr"}, response_format)
+        return output(
+            {
+                "chat": chat,
+                "count": len(messages),
+                "messages": messages,
+                "backend": backend_name(),
+            },
+            response_format,
+        )
     except Exception as exc:
-        return output({"ready": False, "chat": chat, "error": str(exc), "backend": "macos_vision_ocr"}, "json")
+        return output(
+            {
+                "ready": False,
+                "chat": chat,
+                "error": str(exc),
+                "backend": backend_name(),
+            },
+            "json",
+        )
 
 
 @mcp.tool(
@@ -105,13 +133,29 @@ def wechat_find_todos_ui(chat: str, limit: int = 80, scroll_pages: int = 3, min_
     if not 1 <= limit <= 300 or not 0 <= scroll_pages <= 20 or not 0 <= min_score <= 10:
         raise ValueError("limit must be 1-300, scroll_pages 0-20, min_score 0-10")
     try:
-        from .macos import read_chat
         from .todos import extract_todo_candidates
         messages = read_chat(chat, limit=limit, scroll_pages=scroll_pages)
         candidates = [item.model_dump() for item in extract_todo_candidates(chat, messages, min_score=min_score)]
-        return output({"chat": chat, "count": len(candidates), "items": candidates, "backend": "macos_vision_ocr", "heuristic": True}, response_format)
+        return output(
+            {
+                "chat": chat,
+                "count": len(candidates),
+                "items": candidates,
+                "backend": backend_name(),
+                "heuristic": True,
+            },
+            response_format,
+        )
     except Exception as exc:
-        return output({"ready": False, "chat": chat, "error": str(exc), "backend": "macos_vision_ocr"}, "json")
+        return output(
+            {
+                "ready": False,
+                "chat": chat,
+                "error": str(exc),
+                "backend": backend_name(),
+            },
+            "json",
+        )
 
 
 @mcp.tool(
@@ -153,11 +197,28 @@ def wechat_list_chats(query: str = "", limit: int = 50, offset: int = 0, respons
         return output(_store().list_chats(query, limit, offset), response_format)
     except RuntimeError:
         try:
-            from .macos import list_recent_chats
             items = [item.model_dump() for item in list_recent_chats(min(limit, 100))]
-            return output({"total": len(items), "count": len(items), "offset": 0, "items": items, "has_more": False, "backend": "macos_vision_ocr"}, response_format)
+            return output(
+                {
+                    "total": len(items),
+                    "count": len(items),
+                    "offset": 0,
+                    "items": items,
+                    "has_more": False,
+                    "backend": backend_name(),
+                },
+                response_format,
+            )
         except Exception as exc:
-            return output({"ready": False, "error": str(exc), "next_step": "准备明文快照，或安装 ui 可选依赖后调用 wechat_list_recent_chats。"}, "json")
+            return output(
+                {
+                    "ready": False,
+                    "error": str(exc),
+                    "backend": backend_name(),
+                    "next_step": f"准备明文快照，或{install_hint()}",
+                },
+                "json",
+            )
 
 
 @mcp.tool(
@@ -173,11 +234,28 @@ def wechat_read_chat(chat: str, start_time: str | None = None, end_time: str | N
         return output(_store().read_chat(chat, _ts(start_time), _ts(end_time), limit), response_format)
     except RuntimeError:
         try:
-            from .macos import read_chat
             messages = [item.model_dump() for item in read_chat(chat, limit=min(limit, 300), scroll_pages=3)]
-            return output({"chat": {"display_name": chat}, "count": len(messages), "messages": messages, "backend": "macos_vision_ocr", "precision_note": "OCR 兜底可能缺少精确时间和 sender；准备明文快照后可获得数据库事实。"}, response_format)
+            return output(
+                {
+                    "chat": {"display_name": chat},
+                    "count": len(messages),
+                    "messages": messages,
+                    "backend": backend_name(),
+                    "precision_note": "OCR 兜底可能缺少精确时间和 sender；准备明文快照后可获得数据库事实。",
+                },
+                response_format,
+            )
         except Exception as exc:
-            return output({"ready": False, "chat": chat, "error": str(exc), "next_step": "准备明文快照，或安装 ui 可选依赖后调用 wechat_read_chat_ui。"}, "json")
+            return output(
+                {
+                    "ready": False,
+                    "chat": chat,
+                    "error": str(exc),
+                    "backend": backend_name(),
+                    "next_step": f"准备明文快照，或{install_hint()}",
+                },
+                "json",
+            )
 
 
 @mcp.tool(
