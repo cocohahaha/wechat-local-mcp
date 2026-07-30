@@ -261,7 +261,14 @@ class ChatStore:
             return partial[0]
         raise ValueError("chat name is ambiguous; candidates: " + ", ".join(x["display_name"] for x in partial))
 
-    def _iter_rows(self, username: str, start_ts: int | None, end_ts: int | None) -> Iterable[tuple[sqlite3.Row, dict[str, Any], dict[int, str]]]:
+    def _iter_rows(
+        self,
+        username: str,
+        start_ts: int | None,
+        end_ts: int | None,
+        *,
+        newest_first: bool = False,
+    ) -> Iterable[tuple[sqlite3.Row, dict[str, Any], dict[int, str]]]:
         target = table_for(username)
         chat = {"username": username, "display_name": self.contacts.get(username, username), "is_group": "@chatroom" in username}
         for path in _tables(self.root):
@@ -280,6 +287,8 @@ class ChatStore:
                     if end_ts is not None:
                         where.append("create_time <= ?"); params.append(end_ts)
                     sql = f"SELECT {', '.join(selected)} FROM [{target}]" + ((" WHERE " + " AND ".join(where)) if where else "")
+                    if newest_first:
+                        sql += " ORDER BY create_time DESC, local_id DESC"
                     names = _name_map(con)
                     for row in con.execute(sql, params):
                         yield row, chat, names
@@ -355,6 +364,54 @@ class ChatStore:
         messages = [_row_message(row, resolved, self.contacts, names) for row, _, names in self._iter_rows(resolved["username"], start_ts, end_ts)]
         messages.sort(key=lambda x: (x["timestamp"], str(x["local_id"])))
         return {"chat": resolved, "count": len(messages[-limit:]), "messages": messages[-limit:]}
+
+    def media_messages(
+        self,
+        chat: str,
+        media_types: set[str],
+        start_ts: int | None = None,
+        end_ts: int | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """List image and voice messages without loading unrelated message bodies."""
+
+        type_numbers = {
+            "image": 3,
+            "voice": 34,
+        }
+        allowed = {type_numbers[name] for name in media_types}
+        resolved = self.resolve(chat)
+        items: list[dict[str, Any]] = []
+        total = 0
+        for row, _, names in self._iter_rows(
+            resolved["username"],
+            start_ts,
+            end_ts,
+            newest_first=True,
+        ):
+            base_type, _ = split_type(row["local_type"])
+            if base_type not in allowed:
+                continue
+            if total >= offset and len(items) < limit:
+                item = _row_message(row, resolved, self.contacts, names)
+                item["media_kind"] = "image" if base_type == 3 else "voice"
+                items.append(item)
+            total += 1
+        return {
+            "chat": resolved,
+            "media_types": sorted(media_types),
+            "total": total,
+            "count": len(items),
+            "offset": offset,
+            "items": items,
+            "has_more": offset + len(items) < total,
+            "next_offset": (
+                offset + len(items)
+                if offset + len(items) < total
+                else None
+            ),
+        }
 
     def search(self, query: str, chats: list[str] | None = None, start_ts: int | None = None, end_ts: int | None = None, limit: int = 50, offset: int = 0) -> dict[str, Any]:
         if not query.strip():

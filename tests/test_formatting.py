@@ -9,6 +9,7 @@ from mcp.types import CallToolResult
 from wechat_local_mcp.formatting import output
 from wechat_local_mcp.server import (
     wechat_chat_summary,
+    wechat_extract_media_text,
     wechat_find_todos,
     wechat_find_todos_ui,
     wechat_list_chats,
@@ -16,6 +17,7 @@ from wechat_local_mcp.server import (
     wechat_read_chat,
     wechat_read_chat_ui,
     wechat_recent_messages,
+    wechat_search_media_text,
     wechat_search_messages,
 )
 
@@ -52,10 +54,12 @@ def test_all_query_tools_default_to_json() -> None:
         wechat_list_recent_chats,
         wechat_read_chat_ui,
         wechat_find_todos_ui,
+        wechat_extract_media_text,
         wechat_list_chats,
         wechat_read_chat,
         wechat_search_messages,
         wechat_recent_messages,
+        wechat_search_media_text,
         wechat_find_todos,
         wechat_chat_summary,
     )

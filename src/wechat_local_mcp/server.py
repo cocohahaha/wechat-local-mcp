@@ -7,9 +7,17 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from .config import account_dir, decrypted_dir, load_keys, paths, status
+from .config import (
+    account_dir,
+    decrypted_dir,
+    load_keys,
+    paths,
+    status,
+    whisper_model,
+)
 from .crypto import sync_databases
 from .formatting import JsonToolResult, output
+from .media import MediaTextExtractor
 from .platform_ui import (
     backend_name,
     diagnose,
@@ -43,6 +51,32 @@ def _store() -> ChatStore:
     return store
 
 
+def _media() -> MediaTextExtractor:
+    extractor = MediaTextExtractor()
+    if not extractor.store.ready():
+        raise RuntimeError(
+            "微信聊天快照尚未就绪。先运行 wechat_status；媒体文字提取需要"
+            "已解密的 message_*.db、media_0.db 和本机微信缓存。"
+        )
+    return extractor
+
+
+def _media_types(values: list[str] | None) -> set[str]:
+    selected = {
+        value.casefold().strip()
+        for value in (values or ["image", "voice"])
+    }
+    invalid = selected.difference({"image", "voice"})
+    if invalid:
+        raise ValueError(
+            "media_types only supports 'image' and 'voice': "
+            + ", ".join(sorted(invalid))
+        )
+    if not selected:
+        raise ValueError("media_types must contain image or voice")
+    return selected
+
+
 @mcp.tool(
     name="wechat_status",
     title="检查本地微信接入状态",
@@ -69,6 +103,145 @@ def wechat_ui_diagnose() -> JsonToolResult:
                 "error": str(exc),
                 "backend": backend_name(),
                 "next_step": install_hint(),
+            },
+            "json",
+        )
+
+
+@mcp.tool(
+    name="wechat_media_status",
+    title="检查微信图片与语音转文字状态",
+    description=(
+        "只读检查微信图片缓存、语音数据库、本地 OCR、SILK 解码器、"
+        "离线 Whisper 和派生文字缓存是否就绪；不返回聊天正文。"
+    ),
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def wechat_media_status() -> JsonToolResult:
+    try:
+        return output(_media().status(), "json")
+    except Exception as exc:
+        return output(
+            {
+                "ready": False,
+                "error": str(exc),
+                "next_step": (
+                    "运行 wechat_status；然后执行 "
+                    "uv sync --extra ui --extra media。"
+                ),
+            },
+            "json",
+        )
+
+
+@mcp.tool(
+    name="wechat_extract_media_text",
+    title="把微信图片和语音消息转换为文字",
+    description=(
+        "从指定聊天的本地快照中分页列出图片/语音消息：图片使用 macOS "
+        "Vision OCR，语音从 media_0.db 读取微信 SILK 数据并用本机 MLX "
+        "Whisper 转写。结果返回 JSON 并缓存派生文字；不会上传媒体、发送消息"
+        "或修改微信数据库。首次语音转写会从 Hugging Face 下载所选模型。"
+    ),
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+def wechat_extract_media_text(
+    chat: str,
+    media_types: list[str] | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+    language: str = "zh",
+    model: str | None = None,
+    refresh: bool = False,
+    response_format: str = "json",
+) -> JsonToolResult:
+    if not 1 <= limit <= 100 or offset < 0:
+        raise ValueError("limit must be 1-100 and offset must be >= 0")
+    if not 2 <= len(language) <= 20:
+        raise ValueError("language must be a short Whisper language code")
+    try:
+        data = _media().extract(
+            chat=chat,
+            media_types=_media_types(media_types),
+            start_ts=_ts(start_time),
+            end_ts=_ts(end_time),
+            limit=limit,
+            offset=offset,
+            language=language,
+            model=(model or whisper_model()).strip(),
+            refresh=refresh,
+        )
+        return output(data, response_format)
+    except Exception as exc:
+        return output(
+            {
+                "ready": False,
+                "chat": chat,
+                "error": str(exc),
+                "next_step": (
+                    "确认明文快照已同步；图片请先在微信中打开一次，"
+                    "语音请运行 uv sync --extra media。"
+                ),
+            },
+            "json",
+        )
+
+
+@mcp.tool(
+    name="wechat_search_media_text",
+    title="搜索已转换的微信图片与语音文字",
+    description=(
+        "在本机派生文字缓存中搜索图片 OCR 和语音转写，支持聊天、媒体类型"
+        "与 offset/limit 分页。只读取本机缓存，不操作微信。"
+    ),
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def wechat_search_media_text(
+    query: str,
+    chat: str | None = None,
+    media_types: list[str] | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    response_format: str = "json",
+) -> JsonToolResult:
+    if not query.strip():
+        raise ValueError("query must not be empty")
+    if not 1 <= limit <= 200 or offset < 0:
+        raise ValueError("limit must be 1-200 and offset must be >= 0")
+    try:
+        return output(
+            _media().search(
+                query=query,
+                chat=chat,
+                media_types=_media_types(media_types),
+                limit=limit,
+                offset=offset,
+            ),
+            response_format,
+        )
+    except Exception as exc:
+        return output(
+            {
+                "ready": False,
+                "query": query,
+                "error": str(exc),
             },
             "json",
         )

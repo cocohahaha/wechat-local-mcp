@@ -14,6 +14,10 @@ if sys.platform == "win32":
         Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData/Local")))
         / "wechat-local-vault/decrypted/current"
     )
+    MEDIA_TEXT_DEFAULT = (
+        Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData/Local")))
+        / "wechat-local-vault/media-text"
+    )
     KEYS_DEFAULT = (
         Path(os.environ.get("APPDATA", str(Path.home() / "AppData/Roaming")))
         / "wechat-local-mcp/keys.json"
@@ -21,8 +25,10 @@ if sys.platform == "win32":
 else:
     CONTAINER_DEFAULT = Path.home() / "Library/Containers/com.tencent.xinWeChat/Data/Documents"
     DECRYPTED_DEFAULT = Path.home() / "Library/Application Support/wechat-local-vault/decrypted/current"
+    MEDIA_TEXT_DEFAULT = Path.home() / "Library/Application Support/wechat-local-vault/media-text"
     KEYS_DEFAULT = Path.home() / ".config/wechat-local-mcp/keys.json"
 LEGACY_KEYS_DEFAULT = Path.home() / ".config/wechat-keys.json"
+WHISPER_MODEL_DEFAULT = "mlx-community/whisper-small-mlx"
 
 
 @dataclass(frozen=True)
@@ -48,6 +54,20 @@ def keys_file() -> Path:
     if KEYS_DEFAULT.exists() or not LEGACY_KEYS_DEFAULT.exists():
         return KEYS_DEFAULT
     return LEGACY_KEYS_DEFAULT
+
+
+def media_text_dir() -> Path:
+    """Return the local cache directory for derived OCR and transcripts."""
+
+    return Path(
+        os.environ.get("WECHAT_MEDIA_TEXT_DIR", str(MEDIA_TEXT_DEFAULT))
+    ).expanduser()
+
+
+def whisper_model() -> str:
+    """Return the local MLX Whisper model identifier used for voice messages."""
+
+    return os.environ.get("WECHAT_WHISPER_MODEL", WHISPER_MODEL_DEFAULT).strip()
 
 
 def account_dir(container: Path | None = None) -> Path | None:
@@ -114,9 +134,11 @@ def status() -> dict[str, Any]:
         },
         "keys_file": str(p.keys_file),
         "keys_available": p.keys_file.exists(),
+        "media_text_dir": str(media_text_dir()),
+        "whisper_model": whisper_model(),
         "ready": (p.decrypted_dir / "contact/contact.db").exists() and bool(list((p.decrypted_dir / "message").glob("message_*.db"))) if (p.decrypted_dir / "message").is_dir() else False,
         "privacy": {
-            "network": "none required",
+            "network": "none after the optional local speech model download",
             "write_access": "only the configured decrypted snapshot and local state file",
             "message_writes": False,
         },
