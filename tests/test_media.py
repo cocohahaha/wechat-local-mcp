@@ -6,6 +6,10 @@ from pathlib import Path
 import sqlite3
 
 from wechat_local_mcp.media import MediaTextExtractor
+from wechat_local_mcp.server import (
+    wechat_read_chat,
+    wechat_search_messages,
+)
 
 
 def make_media_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -72,11 +76,7 @@ def make_media_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     return snapshot, account, cache
 
 
-def test_extracts_and_caches_image_and_voice_text(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    snapshot, account, cache = make_media_fixture(tmp_path)
+def mock_media_engines(monkeypatch) -> None:
     monkeypatch.setattr(
         "wechat_local_mcp.media._ocr_image",
         lambda path: {
@@ -98,6 +98,14 @@ def test_extracts_and_caches_image_and_voice_text(
             "segments": [],
         },
     )
+
+
+def test_extracts_and_caches_image_and_voice_text(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    snapshot, account, cache = make_media_fixture(tmp_path)
+    mock_media_engines(monkeypatch)
     extractor = MediaTextExtractor(
         snapshot=snapshot,
         account=account,
@@ -149,3 +157,48 @@ def test_extracts_and_caches_image_and_voice_text(
     )
     assert search["count"] == 1
     assert search["items"][0]["media_kind"] == "voice"
+
+
+def test_normal_chat_read_automatically_converts_media(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    snapshot, account, cache = make_media_fixture(tmp_path)
+    mock_media_engines(monkeypatch)
+    extractor = MediaTextExtractor(
+        snapshot=snapshot,
+        account=account,
+        cache=cache,
+    )
+    monkeypatch.setattr(
+        "wechat_local_mcp.server._store",
+        lambda: extractor.store,
+    )
+    monkeypatch.setattr(
+        "wechat_local_mcp.server._media",
+        lambda: extractor,
+    )
+
+    read_result = wechat_read_chat("媒体测试", limit=10)
+    read_data = read_result.structuredContent
+    assert read_data["media_text"]["automatic"] is True
+    assert read_data["media_text"]["converted"] == 2
+    assert {
+        item["content"]
+        for item in read_data["messages"]
+    } == {"图片里的项目排期", "明天确认报价"}
+    assert {
+        item["content_source"]
+        for item in read_data["messages"]
+    } == {"image_ocr", "voice_transcript"}
+    assert all("original_content" in item for item in read_data["messages"])
+
+    search_result = wechat_search_messages(
+        "确认报价",
+        chats=["媒体测试"],
+        limit=10,
+    )
+    search_data = search_result.structuredContent
+    assert search_data["count"] == 1
+    assert search_data["items"][0]["content"] == "明天确认报价"
+    assert search_data["items"][0]["content_source"] == "voice_transcript"

@@ -61,20 +61,156 @@ def _media() -> MediaTextExtractor:
     return extractor
 
 
-def _media_types(values: list[str] | None) -> set[str]:
-    selected = {
-        value.casefold().strip()
-        for value in (values or ["image", "voice"])
+def _with_automatic_media(
+    data: dict,
+    collection_key: str,
+    *,
+    extractor: MediaTextExtractor | None = None,
+) -> dict:
+    """Enrich image and voice messages as part of normal message collection."""
+
+    media = extractor or _media()
+    items = media.enrich_messages(
+        data.get(collection_key, []),
+        default_chat=data.get("chat"),
+        language="zh",
+        model=whisper_model(),
+    )
+    processed = [
+        item for item in items
+        if item.get("content_source") in {"image_ocr", "voice_transcript"}
+    ]
+    unavailable = [
+        item for item in items
+        if (item.get("media") or {}).get("status") == "unavailable"
+    ]
+    return data | {
+        collection_key: items,
+        "media_text": {
+            "automatic": True,
+            "converted": len(processed),
+            "unavailable": len(unavailable),
+            "local_only": True,
+        },
     }
-    invalid = selected.difference({"image", "voice"})
-    if invalid:
-        raise ValueError(
-            "media_types only supports 'image' and 'voice': "
-            + ", ".join(sorted(invalid))
+
+
+def _cached_media_message(item: dict) -> dict:
+    """Convert one cached media result to the normal message schema."""
+
+    kind = str(item.get("media_kind") or "")
+    chat = item.get("chat") or {}
+    text = str((item.get("derived_text") or {}).get("text") or "").strip()
+    return {
+        "local_id": item.get("local_id"),
+        "local_type": item.get("local_type"),
+        "type": "图片" if kind == "image" else "语音",
+        "sender": item.get("sender") or "",
+        "sender_username": item.get("sender_username") or "",
+        "timestamp": item.get("timestamp") or 0,
+        "time": item.get("time") or "",
+        "content": text,
+        "original_content": "[图片]" if kind == "image" else "[语音]",
+        "content_source": (
+            "image_ocr" if kind == "image" else "voice_transcript"
+        ),
+        "reply_to": None,
+        "mentions": [],
+        "chat": {
+            key: chat.get(key)
+            for key in ("username", "display_name", "kind")
+        },
+        "media": item | {"cached": True},
+    }
+
+
+def _search_with_automatic_media(
+    query: str,
+    chats: list[str] | None,
+    start_ts: int | None,
+    end_ts: int | None,
+    limit: int,
+    offset: int,
+) -> dict:
+    """Search normal messages plus media text collected automatically earlier."""
+
+    store = _store()
+    extractor = _media()
+    raw = store.search(
+        query,
+        chats,
+        start_ts,
+        end_ts,
+        limit=2_147_483_647,
+        offset=0,
+    )
+    raw = _with_automatic_media(raw, "items", extractor=extractor)
+    wanted = (
+        {store.resolve(chat)["username"] for chat in chats}
+        if chats
+        else None
+    )
+    cached = extractor.search(
+        query=query,
+        chat=None,
+        media_types={"image", "voice"},
+        limit=2_147_483_647,
+        offset=0,
+    )
+    combined: dict[tuple[str, int, int], dict] = {}
+    for message in raw["items"]:
+        chat_data = message.get("chat") or {}
+        key = (
+            str(chat_data.get("username") or ""),
+            int(message.get("local_id") or 0),
+            int(message.get("timestamp") or 0),
         )
-    if not selected:
-        raise ValueError("media_types must contain image or voice")
-    return selected
+        combined[key] = message
+    for result in cached["items"]:
+        chat_data = result.get("chat") or {}
+        username = str(chat_data.get("username") or "")
+        timestamp = int(result.get("timestamp") or 0)
+        if wanted is not None and username not in wanted:
+            continue
+        if start_ts is not None and timestamp < start_ts:
+            continue
+        if end_ts is not None and timestamp > end_ts:
+            continue
+        message = _cached_media_message(result)
+        key = (
+            username,
+            int(message.get("local_id") or 0),
+            timestamp,
+        )
+        combined.setdefault(key, message)
+    matches = sorted(
+        combined.values(),
+        key=lambda item: (
+            int(item.get("timestamp") or 0),
+            int(item.get("local_id") or 0),
+        ),
+        reverse=True,
+    )
+    total = len(matches)
+    page = matches[offset : offset + limit]
+    return {
+        "query": query,
+        "total": total,
+        "count": len(page),
+        "offset": offset,
+        "items": page,
+        "has_more": offset + len(page) < total,
+        "next_offset": (
+            offset + len(page)
+            if offset + len(page) < total
+            else None
+        ),
+        "media_text": {
+            "automatic": True,
+            "searches_derived_cache": True,
+            "local_only": True,
+        },
+    }
 
 
 @mcp.tool(
@@ -134,114 +270,6 @@ def wechat_media_status() -> JsonToolResult:
                     "运行 wechat_status；然后执行 "
                     "uv sync --extra ui --extra media。"
                 ),
-            },
-            "json",
-        )
-
-
-@mcp.tool(
-    name="wechat_extract_media_text",
-    title="把微信图片和语音消息转换为文字",
-    description=(
-        "从指定聊天的本地快照中分页列出图片/语音消息：图片使用 macOS "
-        "Vision OCR，语音从 media_0.db 读取微信 SILK 数据并用本机 MLX "
-        "Whisper 转写。结果返回 JSON 并缓存派生文字；不会上传媒体、发送消息"
-        "或修改微信数据库。首次语音转写会从 Hugging Face 下载所选模型。"
-    ),
-    annotations={
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-def wechat_extract_media_text(
-    chat: str,
-    media_types: list[str] | None = None,
-    start_time: str | None = None,
-    end_time: str | None = None,
-    limit: int = 20,
-    offset: int = 0,
-    language: str = "zh",
-    model: str | None = None,
-    refresh: bool = False,
-    response_format: str = "json",
-) -> JsonToolResult:
-    if not 1 <= limit <= 100 or offset < 0:
-        raise ValueError("limit must be 1-100 and offset must be >= 0")
-    if not 2 <= len(language) <= 20:
-        raise ValueError("language must be a short Whisper language code")
-    try:
-        data = _media().extract(
-            chat=chat,
-            media_types=_media_types(media_types),
-            start_ts=_ts(start_time),
-            end_ts=_ts(end_time),
-            limit=limit,
-            offset=offset,
-            language=language,
-            model=(model or whisper_model()).strip(),
-            refresh=refresh,
-        )
-        return output(data, response_format)
-    except Exception as exc:
-        return output(
-            {
-                "ready": False,
-                "chat": chat,
-                "error": str(exc),
-                "next_step": (
-                    "确认明文快照已同步；图片请先在微信中打开一次，"
-                    "语音请运行 uv sync --extra media。"
-                ),
-            },
-            "json",
-        )
-
-
-@mcp.tool(
-    name="wechat_search_media_text",
-    title="搜索已转换的微信图片与语音文字",
-    description=(
-        "在本机派生文字缓存中搜索图片 OCR 和语音转写，支持聊天、媒体类型"
-        "与 offset/limit 分页。只读取本机缓存，不操作微信。"
-    ),
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-def wechat_search_media_text(
-    query: str,
-    chat: str | None = None,
-    media_types: list[str] | None = None,
-    limit: int = 50,
-    offset: int = 0,
-    response_format: str = "json",
-) -> JsonToolResult:
-    if not query.strip():
-        raise ValueError("query must not be empty")
-    if not 1 <= limit <= 200 or offset < 0:
-        raise ValueError("limit must be 1-200 and offset must be >= 0")
-    try:
-        return output(
-            _media().search(
-                query=query,
-                chat=chat,
-                media_types=_media_types(media_types),
-                limit=limit,
-                offset=offset,
-            ),
-            response_format,
-        )
-    except Exception as exc:
-        return output(
-            {
-                "ready": False,
-                "query": query,
-                "error": str(exc),
             },
             "json",
         )
@@ -402,14 +430,27 @@ def wechat_list_chats(query: str = "", limit: int = 50, offset: int = 0, respons
 @mcp.tool(
     name="wechat_read_chat",
     title="读取微信聊天记录",
-    description="按联系人昵称、备注、群名或微信 ID 读取消息；可用 ISO-8601 时间范围和 limit 限制结果。",
-    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    description=(
+        "按联系人昵称、备注、群名或微信 ID 读取消息；图片会自动 OCR，"
+        "语音会自动转写并直接写入消息 content。媒体处理只使用本机数据，"
+        "首次语音识别可能下载本地模型。"
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
 )
 def wechat_read_chat(chat: str, start_time: str | None = None, end_time: str | None = None, limit: int = 200, response_format: str = "json") -> JsonToolResult:
     if not 1 <= limit <= 5000:
         raise ValueError("limit must be 1-5000")
     try:
-        return output(_store().read_chat(chat, _ts(start_time), _ts(end_time), limit), response_format)
+        data = _store().read_chat(
+            chat,
+            _ts(start_time),
+            _ts(end_time),
+            limit,
+        )
+        return output(
+            _with_automatic_media(data, "messages"),
+            response_format,
+        )
     except RuntimeError:
         try:
             messages = [item.model_dump() for item in read_chat(chat, limit=min(limit, 300), scroll_pages=3)]
@@ -439,25 +480,44 @@ def wechat_read_chat(chat: str, start_time: str | None = None, end_time: str | N
 @mcp.tool(
     name="wechat_search_messages",
     title="搜索微信消息",
-    description="在全部聊天或指定聊天中搜索文本消息，支持时间范围、offset/limit 和 JSON/Markdown 输出。",
-    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    description=(
+        "在全部聊天或指定聊天中搜索消息，同时搜索读取聊天时自动生成的"
+        "图片 OCR 和语音转写缓存；支持时间范围和 offset/limit。"
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
 )
 def wechat_search_messages(query: str, chats: list[str] | None = None, start_time: str | None = None, end_time: str | None = None, limit: int = 50, offset: int = 0, response_format: str = "json") -> JsonToolResult:
     if not 1 <= limit <= 500 or offset < 0:
         raise ValueError("limit must be 1-500 and offset must be >= 0")
-    return output(_store().search(query, chats, _ts(start_time), _ts(end_time), limit, offset), response_format)
+    return output(
+        _search_with_automatic_media(
+            query,
+            chats,
+            _ts(start_time),
+            _ts(end_time),
+            limit,
+            offset,
+        ),
+        response_format,
+    )
 
 
 @mcp.tool(
     name="wechat_recent_messages",
     title="获取最近微信消息",
-    description="从指定聊天或全部聊天中按时间倒序返回最近消息。",
-    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    description=(
+        "从指定聊天或全部聊天中按时间倒序返回最近消息；遇到图片和语音时"
+        "自动 OCR/转写，并把识别文字直接放进 content。"
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
 )
 def wechat_recent_messages(chats: list[str] | None = None, limit: int = 50, response_format: str = "json") -> JsonToolResult:
     if not 1 <= limit <= 500:
         raise ValueError("limit must be 1-500")
-    return output(_store().recent(chats, limit), response_format)
+    return output(
+        _with_automatic_media(_store().recent(chats, limit), "items"),
+        response_format,
+    )
 
 
 @mcp.tool(
@@ -475,20 +535,42 @@ def wechat_find_todos(chats: list[str] | None = None, days: int = 30, limit: int
 @mcp.tool(
     name="wechat_chat_summary",
     title="汇总单个微信聊天",
-    description="返回指定聊天的消息量、参与者、行动项候选和最近消息，供模型进一步生成摘要。",
-    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    description=(
+        "返回指定聊天的消息量、参与者、行动项候选和最近消息；图片和语音"
+        "先自动转换为文字，因此会自然参与摘要和行动项判断。"
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
 )
 def wechat_chat_summary(chat: str, start_time: str | None = None, end_time: str | None = None, max_messages: int = 1000, response_format: str = "json") -> JsonToolResult:
     if not 1 <= max_messages <= 5000:
         raise ValueError("max_messages must be 1-5000")
-    data = _store().read_chat(chat, _ts(start_time), _ts(end_time), max_messages)
+    data = _with_automatic_media(
+        _store().read_chat(
+            chat,
+            _ts(start_time),
+            _ts(end_time),
+            max_messages,
+        ),
+        "messages",
+    )
     people: dict[str, int] = {}
     todos = []
     for item in data["messages"]:
         people[item["sender"]] = people.get(item["sender"], 0) + 1
         if any(term in item["content"].casefold() for term in ("待办", "todo", "截止", "请", "需要", "跟进", "deadline")):
             todos.append(item)
-    summary = {"chat": data["chat"], "message_count": data["count"], "participants": sorted(people.items(), key=lambda x: x[1], reverse=True), "todo_candidates": todos[:100], "messages": data["messages"]}
+    summary = {
+        "chat": data["chat"],
+        "message_count": data["count"],
+        "participants": sorted(
+            people.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        ),
+        "todo_candidates": todos[:100],
+        "messages": data["messages"],
+        "media_text": data["media_text"],
+    }
     return output(summary, response_format)
 
 

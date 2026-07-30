@@ -196,20 +196,18 @@ codex mcp add wechat-local -- `
 - `wechat_status`：检查微信版本、数据库、密钥与快照状态。
 - `wechat_sync`：按 keys.json 解密数据库到独立快照目录。
 - `wechat_list_chats`：列出联系人和群聊，支持分页。
-- `wechat_read_chat`：按昵称、备注、群名或微信 ID 读取消息。
-- `wechat_search_messages`：按关键词、聊天和时间范围搜索消息。
-- `wechat_recent_messages`：汇总最近消息。
+- `wechat_read_chat`：按昵称、备注、群名或微信 ID 读取消息，并自动转换其中的图片和语音。
+- `wechat_search_messages`：按关键词、聊天和时间范围搜索普通消息及已自动转换的媒体文字。
+- `wechat_recent_messages`：汇总最近消息，并自动转换其中的图片和语音。
 - `wechat_find_todos`：用可解释的中英文行动项启发式找待办候选。
-- `wechat_chat_summary`：返回参与者统计和待办候选，供模型进一步总结。
+- `wechat_chat_summary`：自动转换媒体后返回参与者统计、待办候选和消息。
 - `wechat_media_status`：检查图片缓存、SILK 解码和离线 Whisper 是否就绪。
-- `wechat_extract_media_text`：把指定聊天的图片/语音消息转换为文字并缓存。
-- `wechat_search_media_text`：搜索已经转换的图片 OCR 和语音转写。
 - `wechat_ui_diagnose`：诊断屏幕录制/OCR 只读兜底。
 - `wechat_list_recent_chats`：数据库快照不可用时读取当前窗口可见会话。
 - `wechat_read_chat_ui`：数据库快照不可用时用本机 OCR 读取聊天。
 - `wechat_find_todos_ui`：对 OCR 结果做待办候选提取。
 
-所有微信访问都是只读的；`wechat_extract_media_text` 只在独立目录写入派生文字缓存。`wechat_find_todos` 只返回候选，不会替你创建任务、发消息或修改微信。
+所有微信访问都是只读的；普通消息读取工具只在独立目录自动写入派生文字缓存。`wechat_find_todos` 只返回候选，不会替你创建任务、发消息或修改微信。
 
 ### 图片和语音转文字
 
@@ -220,26 +218,25 @@ uv run --python /opt/homebrew/bin/python3.12 wechat-local-sync sync
 uv sync --extra ui --extra media --python /opt/homebrew/bin/python3.12
 ```
 
-MCP 调用示例：
+直接调用原来的消息读取工具，无需先调用单独的媒体工具：
 
 ```json
 {
   "chat": "聊天名称",
-  "media_types": ["image", "voice"],
-  "limit": 20,
-  "offset": 0,
-  "language": "zh",
+  "limit": 50,
   "response_format": "json"
 }
 ```
 
-返回的每条媒体消息包含：
+`wechat_read_chat`、`wechat_recent_messages` 和 `wechat_chat_summary` 遇到图片或语音时会自动处理。识别成功后：
 
-- 原消息 `local_id`、发送者、时间和媒体类型；
-- `derived_text.text`：图片 OCR 或语音转写正文；
-- `engine`、模型、语言、置信信息和分段；
-- `cached`：是否复用了本地派生结果；
+- 消息的 `content` 直接变成图片 OCR 或语音转写正文；
+- `original_content` 保留原来的 `[图片]`、`[语音]` 占位信息；
+- `content_source` 标识 `image_ocr` 或 `voice_transcript`；
+- `media` 保留引擎、模型、置信信息、分段和 `cached` 状态；
 - 无法识别时的具体原因，例如“图片未在本机缓存”。
+
+`wechat_search_messages` 会同时搜索普通文本和这些自动生成的媒体文字缓存，不需要 Agent 选择另一套搜索工具。
 
 图片优先读取微信本机的高清/中图缓存，找不到时使用缩略图。若结果提示图片未缓存，请先在微信中打开一次原图。语音默认使用 `mlx-community/whisper-small-mlx`；可设置：
 

@@ -16,7 +16,7 @@ from typing import Any, Iterator
 import wave
 
 from .config import account_dir, container_dir, decrypted_dir, media_text_dir
-from .store import ChatStore, table_for
+from .store import ChatStore, split_type, table_for
 
 
 VOICE_SAMPLE_RATE = 24_000
@@ -289,6 +289,150 @@ class MediaTextExtractor:
             },
         }
 
+    def _derive_message(
+        self,
+        *,
+        chat: dict[str, Any],
+        message: dict[str, Any],
+        language: str,
+        model: str,
+        refresh: bool,
+    ) -> dict[str, Any]:
+        """Return one cached or newly derived media-text result."""
+
+        local_id = int(message["local_id"])
+        timestamp = int(message["timestamp"])
+        base_type, _ = split_type(message["local_type"])
+        if base_type not in (3, 34):
+            raise ValueError("message is not an image or voice message")
+        kind = "image" if base_type == 3 else "voice"
+        username = str(chat["username"])
+        engine_key = (
+            f"{model}:{language}"
+            if kind == "voice"
+            else "macos_vision"
+        )
+        key = _cache_key(
+            chat_username=username,
+            local_id=local_id,
+            timestamp=timestamp,
+            media_kind=kind,
+            engine_key=engine_key,
+        )
+        cache_path = self.cache / f"{key}.json"
+        cached = None if refresh else _safe_json(cache_path)
+        if cached is not None:
+            return cached | {"cached": True}
+
+        base = {
+            "chat": chat,
+            "local_id": local_id,
+            "local_type": message["local_type"],
+            "media_kind": kind,
+            "sender": message["sender"],
+            "sender_username": message["sender_username"],
+            "timestamp": timestamp,
+            "time": message["time"],
+        }
+        try:
+            if kind == "image":
+                if self.account is None:
+                    raise RuntimeError("未找到本机微信账号缓存目录。")
+                candidates = _image_candidates(
+                    self.account,
+                    username,
+                    local_id,
+                    timestamp,
+                )
+                if not candidates:
+                    raise RuntimeError(
+                        "本地没有该图片缓存。请在微信中打开一次原图后重试。"
+                    )
+                derived = _ocr_image(candidates[0])
+                result = base | {
+                    "status": "ok",
+                    "media_source": str(candidates[0]),
+                    "derived_text": derived,
+                }
+            else:
+                voice_data = _voice_blob(
+                    self.snapshot,
+                    username,
+                    local_id,
+                    timestamp,
+                )
+                if not voice_data:
+                    raise RuntimeError("明文快照中没有找到该语音数据。")
+                derived = _transcribe_voice(
+                    voice_data,
+                    language=language,
+                    model=model,
+                )
+                result = base | {
+                    "status": "ok",
+                    "media_source": "decrypted_snapshot:media_0.db",
+                    "derived_text": derived,
+                }
+            _write_json(cache_path, result)
+            return result | {"cached": False}
+        except Exception as exc:
+            return base | {
+                "status": "unavailable",
+                "error": str(exc),
+                "derived_text": None,
+                "cached": False,
+            }
+
+    def enrich_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        default_chat: dict[str, Any] | None = None,
+        language: str,
+        model: str,
+        refresh: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Automatically replace image/voice placeholders with derived text."""
+
+        enriched: list[dict[str, Any]] = []
+        for message in messages:
+            base_type, _ = split_type(message.get("local_type"))
+            if base_type not in (3, 34):
+                enriched.append(message)
+                continue
+            chat = message.get("chat") or default_chat
+            if not isinstance(chat, dict) or not chat.get("username"):
+                enriched.append(
+                    message
+                    | {
+                        "media": {
+                            "status": "unavailable",
+                            "error": "媒体消息缺少聊天标识，无法定位本机缓存。",
+                        }
+                    }
+                )
+                continue
+            result = self._derive_message(
+                chat=chat,
+                message=message,
+                language=language,
+                model=model,
+                refresh=refresh,
+            )
+            item = message | {
+                "original_content": message.get("content", ""),
+                "media": result,
+            }
+            derived = result.get("derived_text") or {}
+            text = str(derived.get("text") or "").strip()
+            if result.get("status") == "ok" and text:
+                item["content"] = text
+                item["content_source"] = (
+                    "image_ocr" if base_type == 3 else "voice_transcript"
+                )
+            enriched.append(item)
+        return enriched
+
     def extract(
         self,
         *,
@@ -310,91 +454,17 @@ class MediaTextExtractor:
             limit,
             offset,
         )
-        username = str(page["chat"]["username"])
         output_items: list[dict[str, Any]] = []
         for message in page["items"]:
-            local_id = int(message["local_id"])
-            timestamp = int(message["timestamp"])
-            kind = str(message["media_kind"])
-            engine_key = (
-                f"{model}:{language}"
-                if kind == "voice"
-                else "macos_vision"
-            )
-            key = _cache_key(
-                chat_username=username,
-                local_id=local_id,
-                timestamp=timestamp,
-                media_kind=kind,
-                engine_key=engine_key,
-            )
-            cache_path = self.cache / f"{key}.json"
-            cached = None if refresh else _safe_json(cache_path)
-            if cached is not None:
-                output_items.append(cached | {"cached": True})
-                continue
-
-            base = {
-                "chat": page["chat"],
-                "local_id": local_id,
-                "local_type": message["local_type"],
-                "media_kind": kind,
-                "sender": message["sender"],
-                "sender_username": message["sender_username"],
-                "timestamp": timestamp,
-                "time": message["time"],
-            }
-            try:
-                if kind == "image":
-                    if self.account is None:
-                        raise RuntimeError("未找到本机微信账号缓存目录。")
-                    candidates = _image_candidates(
-                        self.account,
-                        username,
-                        local_id,
-                        timestamp,
-                    )
-                    if not candidates:
-                        raise RuntimeError(
-                            "本地没有该图片缓存。请在微信中打开一次原图后重试。"
-                        )
-                    derived = _ocr_image(candidates[0])
-                    result = base | {
-                        "status": "ok",
-                        "media_source": str(candidates[0]),
-                        "derived_text": derived,
-                    }
-                else:
-                    voice_data = _voice_blob(
-                        self.snapshot,
-                        username,
-                        local_id,
-                        timestamp,
-                    )
-                    if not voice_data:
-                        raise RuntimeError("明文快照中没有找到该语音数据。")
-                    derived = _transcribe_voice(
-                        voice_data,
-                        language=language,
-                        model=model,
-                    )
-                    result = base | {
-                        "status": "ok",
-                        "media_source": "decrypted_snapshot:media_0.db",
-                        "derived_text": derived,
-                    }
-                _write_json(cache_path, result)
-                output_items.append(result | {"cached": False})
-            except Exception as exc:
-                output_items.append(
-                    base
-                    | {
-                        "status": "unavailable",
-                        "error": str(exc),
-                        "derived_text": None,
-                        "cached": False,
-                    }
+            output_items.append(
+                self._derive_message(
+                    chat=page["chat"],
+                    message=message,
+                    language=language,
+                    model=model,
+                    refresh=refresh,
                 )
+            )
         return {
             **{key: value for key, value in page.items() if key != "items"},
             "items": output_items,
