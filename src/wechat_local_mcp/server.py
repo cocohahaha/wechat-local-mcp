@@ -67,7 +67,7 @@ def _with_automatic_media(
     *,
     extractor: MediaTextExtractor | None = None,
 ) -> dict:
-    """Enrich image and voice messages as part of normal message collection."""
+    """Enrich image, screenshot, voice, and sticker messages automatically."""
 
     media = extractor or _media()
     items = media.enrich_messages(
@@ -78,7 +78,10 @@ def _with_automatic_media(
     )
     processed = [
         item for item in items
-        if item.get("content_source") in {"image_ocr", "voice_transcript"}
+        if item.get("content_source") in {
+            "image_ocr", "screenshot_ocr", "voice_transcript",
+            "sticker_recognition",
+        }
     ]
     unavailable = [
         item for item in items
@@ -100,20 +103,32 @@ def _cached_media_message(item: dict) -> dict:
 
     kind = str(item.get("media_kind") or "")
     chat = item.get("chat") or {}
-    text = str((item.get("derived_text") or {}).get("text") or "").strip()
+    derived = item.get("derived_text") or {}
+    text = str(derived.get("text") or "").strip()
+    visual_kind = str(derived.get("visual_kind") or "image")
+    type_names = {"image": "图片", "voice": "语音", "sticker": "表情包"}
+    placeholders = {"image": "[图片]", "voice": "[语音]", "sticker": "[表情包]"}
+    if kind == "voice":
+        content_source = "voice_transcript"
+        message_kind = "voice"
+    elif kind == "sticker":
+        content_source = "sticker_recognition"
+        message_kind = "sticker"
+    else:
+        content_source = "screenshot_ocr" if visual_kind == "screenshot_candidate" else "image_ocr"
+        message_kind = visual_kind
     return {
         "local_id": item.get("local_id"),
         "local_type": item.get("local_type"),
-        "type": "图片" if kind == "image" else "语音",
+        "type": type_names.get(kind, "媒体"),
+        "message_kind": message_kind,
         "sender": item.get("sender") or "",
         "sender_username": item.get("sender_username") or "",
         "timestamp": item.get("timestamp") or 0,
         "time": item.get("time") or "",
         "content": text,
-        "original_content": "[图片]" if kind == "image" else "[语音]",
-        "content_source": (
-            "image_ocr" if kind == "image" else "voice_transcript"
-        ),
+        "original_content": placeholders.get(kind, "[媒体]"),
+        "content_source": content_source,
         "reply_to": None,
         "mentions": [],
         "chat": {
@@ -153,7 +168,7 @@ def _search_with_automatic_media(
     cached = extractor.search(
         query=query,
         chat=None,
-        media_types={"image", "voice"},
+        media_types={"image", "voice", "sticker"},
         limit=2_147_483_647,
         offset=0,
     )
@@ -246,10 +261,10 @@ def wechat_ui_diagnose() -> JsonToolResult:
 
 @mcp.tool(
     name="wechat_media_status",
-    title="检查微信图片与语音转文字状态",
+    title="检查微信多媒体识别状态",
     description=(
-        "只读检查微信图片缓存、语音数据库、本地 OCR、SILK 解码器、"
-        "离线 Whisper 和派生文字缓存是否就绪；不返回聊天正文。"
+        "只读检查微信图片/截图/表情缓存、语音数据库、本地 OCR、"
+        "SILK 解码器、离线 Whisper 和派生文字缓存是否就绪；不返回聊天正文。"
     ),
     annotations={
         "readOnlyHint": True,
@@ -431,9 +446,9 @@ def wechat_list_chats(query: str = "", limit: int = 50, offset: int = 0, respons
     name="wechat_read_chat",
     title="读取微信聊天记录",
     description=(
-        "按联系人昵称、备注、群名或微信 ID 读取消息；图片会自动 OCR，"
-        "语音会自动转写并直接写入消息 content。媒体处理只使用本机数据，"
-        "首次语音识别可能下载本地模型。"
+        "按联系人昵称、备注、群名或微信 ID 读取消息；图片/截图自动 OCR，"
+        "语音自动转写，表情包读取本地说明，转发的压缩聊天解析为分层 JSON。"
+        "媒体处理只使用本机数据，首次语音识别可能下载本地模型。"
     ),
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
 )
@@ -482,7 +497,7 @@ def wechat_read_chat(chat: str, start_time: str | None = None, end_time: str | N
     title="搜索微信消息",
     description=(
         "在全部聊天或指定聊天中搜索消息，同时搜索读取聊天时自动生成的"
-        "图片 OCR 和语音转写缓存；支持时间范围和 offset/limit。"
+        "图片/截图 OCR、表情识别和语音转写缓存；支持时间范围和 offset/limit。"
     ),
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
 )
@@ -506,8 +521,8 @@ def wechat_search_messages(query: str, chats: list[str] | None = None, start_tim
     name="wechat_recent_messages",
     title="获取最近微信消息",
     description=(
-        "从指定聊天或全部聊天中按时间倒序返回最近消息；遇到图片和语音时"
-        "自动 OCR/转写，并把识别文字直接放进 content。"
+        "从指定聊天或全部聊天中按时间倒序返回最近消息；遇到图片、截图、"
+        "表情包和语音时自动识别，并把派生文字直接放进 content。"
     ),
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
 )
@@ -536,8 +551,8 @@ def wechat_find_todos(chats: list[str] | None = None, days: int = 30, limit: int
     name="wechat_chat_summary",
     title="汇总单个微信聊天",
     description=(
-        "返回指定聊天的消息量、参与者、行动项候选和最近消息；图片和语音"
-        "先自动转换为文字，因此会自然参与摘要和行动项判断。"
+        "返回指定聊天的消息量、参与者、行动项候选和最近消息；图片、截图、"
+        "表情包和语音先自动转换为文字，因此会自然参与摘要和行动项判断。"
     ),
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
 )

@@ -5,7 +5,7 @@ from hashlib import md5
 from pathlib import Path
 import sqlite3
 
-from wechat_local_mcp.media import MediaTextExtractor
+from wechat_local_mcp.media import MediaTextExtractor, _transcribe_faster_whisper
 from wechat_local_mcp.server import (
     wechat_read_chat,
     wechat_search_messages,
@@ -72,7 +72,7 @@ def make_media_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
         / f"1_{timestamp}_thumb.jpg"
     )
     image.parent.mkdir(parents=True)
-    image.write_bytes(b"fake-image-for-mocked-ocr" * 4)
+    image.write_bytes(b"\xff\xd8\xff" + b"fake-image-for-mocked-ocr" * 4)
     return snapshot, account, cache
 
 
@@ -202,3 +202,123 @@ def test_normal_chat_read_automatically_converts_media(
     assert search_data["count"] == 1
     assert search_data["items"][0]["content"] == "明天确认报价"
     assert search_data["items"][0]["content_source"] == "voice_transcript"
+
+
+def test_recognizes_sticker_from_local_caption_database(
+    tmp_path: Path,
+) -> None:
+    snapshot, account, cache = make_media_fixture(tmp_path)
+    username = "wxid_media"
+    table = "Msg_" + md5(username.encode()).hexdigest()
+    sticker_md5 = "aabbccddeeff00112233445566778899"
+    with sqlite3.connect(snapshot / "message/message_0.db") as connection:
+        connection.execute(
+            f"INSERT INTO [{table}] VALUES (3, 47, 2, 1700000002, ?, '')",
+            (f'<msg><emoji md5="{sticker_md5}" type="2" /></msg>',),
+        )
+    (snapshot / "emoticon").mkdir()
+    with sqlite3.connect(snapshot / "emoticon/emoticon.db") as connection:
+        connection.execute(
+            "CREATE TABLE kStoreEmoticonCaptionsTable "
+            "(package_id_ TEXT, md5_ TEXT, language_ TEXT, caption_ TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO kStoreEmoticonCaptionsTable VALUES "
+            "('', ?, 'zh_cn', '收到，马上处理')",
+            (sticker_md5,),
+        )
+    extractor = MediaTextExtractor(
+        snapshot=snapshot, account=account, cache=cache
+    )
+
+    result = extractor.extract(
+        chat="媒体测试",
+        media_types={"sticker"},
+        start_ts=None,
+        end_ts=None,
+        limit=10,
+        offset=0,
+        language="zh",
+        model="test-model",
+        refresh=False,
+    )
+
+    assert result["total"] == 1
+    assert result["items"][0]["media_kind"] == "sticker"
+    assert result["items"][0]["derived_text"]["text"] == "收到，马上处理"
+    assert result["items"][0]["derived_text"]["engine"] == "local_sticker_database"
+
+
+def test_marks_text_heavy_image_as_screenshot_in_normal_read(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    snapshot, account, cache = make_media_fixture(tmp_path)
+    monkeypatch.setattr(
+        "wechat_local_mcp.media._ocr_image",
+        lambda path: {
+            "text": "第一行\n第二行是很长的聊天截图文字\n第三行还有待办信息",
+            "engine": "test_ocr",
+            "confidence": 0.9,
+            "blocks": [],
+            "visual_kind": "screenshot_candidate",
+            "classification": {"heuristic": True, "signals": ["dense_text"]},
+        },
+    )
+    monkeypatch.setattr(
+        "wechat_local_mcp.media._transcribe_voice",
+        lambda data, language, model: {
+            "text": "语音", "engine": "test", "model": model,
+            "language": language, "confidence": 0.8,
+            "review_required": True, "segments": [],
+        },
+    )
+    extractor = MediaTextExtractor(
+        snapshot=snapshot, account=account, cache=cache
+    )
+    messages = extractor.store.read_chat("媒体测试")["messages"]
+    enriched = extractor.enrich_messages(
+        messages,
+        default_chat=extractor.store.resolve("媒体测试"),
+        language="zh",
+        model="test-model",
+    )
+    image = next(item for item in enriched if item["local_type"] == 3)
+    assert image["message_kind"] == "screenshot_candidate"
+    assert image["content_source"] == "screenshot_ocr"
+
+
+def test_faster_whisper_backend_maps_mlx_default_for_windows(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class Segment:
+        start = 0.0
+        end = 1.0
+        text = "确认收到"
+        avg_logprob = -0.1
+
+    class Info:
+        language = "zh"
+
+    class Engine:
+        def transcribe(self, path, **options):
+            assert options["language"] == "zh"
+            return iter([Segment()]), Info()
+
+    selected = []
+    monkeypatch.delenv("WECHAT_FASTER_WHISPER_MODEL", raising=False)
+    monkeypatch.setattr(
+        "wechat_local_mcp.media._faster_whisper_engine",
+        lambda name: selected.append(name) or Engine(),
+    )
+
+    result = _transcribe_faster_whisper(
+        tmp_path / "message.wav",
+        "zh",
+        "mlx-community/whisper-small-mlx",
+    )
+
+    assert selected == ["small"]
+    assert result["engine"] == "faster_whisper"
+    assert result["text"] == "确认收到"

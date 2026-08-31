@@ -4,7 +4,7 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     throw "未找到 uv。请先按照 https://docs.astral.sh/uv/ 安装 uv。"
 }
 
-uv sync --extra windows --extra test --python 3.12
+uv sync --extra windows --extra media --extra test --python 3.12
 uv run pytest -q
 
 Write-Host ""

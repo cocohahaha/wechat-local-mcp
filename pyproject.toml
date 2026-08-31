@@ -1,6 +1,6 @@
 [project]
 name = "wechat-local-mcp"
-version = "0.3.1"
+version = "0.4.0"
 description = "Read-only MCP server for a user's local WeChat chats on macOS and Windows"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,7 +22,9 @@ ui = [
 ]
 media = [
   "pilk>=0.2.4",
+  "pillow>=10.0.0",
   "mlx-whisper>=0.4.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "faster-whisper>=1.2.1; sys_platform != 'darwin' or platform_machine != 'arm64'",
 ]
 windows = [
   "pillow>=10.0.0; sys_platform == 'win32'",

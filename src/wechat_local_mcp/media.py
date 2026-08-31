@@ -1,16 +1,19 @@
-"""Convert locally cached WeChat image and voice messages into text."""
+"""Recognize locally cached WeChat images, stickers, screenshots, and voice."""
 
 from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime
+from functools import lru_cache
 import hashlib
 import importlib.util
 import json
 import math
 import os
+import platform
 from pathlib import Path
 import sqlite3
+import sys
 import tempfile
 from typing import Any, Iterator
 import wave
@@ -20,6 +23,13 @@ from .store import ChatStore, split_type, table_for
 
 
 VOICE_SAMPLE_RATE = 24_000
+
+
+def _has_module(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ModuleNotFoundError):
+        return False
 
 
 def _read_only_connect(path: Path) -> sqlite3.Connection:
@@ -89,7 +99,7 @@ def _image_candidates(
     files = [
         path
         for path in candidates
-        if path.is_file() and path.stat().st_size > 64
+        if path.is_file() and path.stat().st_size > 64 and _looks_like_image(path)
     ]
     return sorted(
         files,
@@ -104,24 +114,119 @@ def _image_candidates(
 
 def _ocr_image(path: Path) -> dict[str, Any]:
     try:
-        from .ocr import recognize_text
+        if sys.platform == "win32":
+            from .windows_ocr import recognize_text
+            engine = "windows_media_ocr"
+        elif sys.platform == "darwin":
+            from .ocr import recognize_text
+            engine = "macos_vision"
+        else:
+            raise RuntimeError("当前系统没有内置 OCR 后端。")
     except ImportError as exc:
         raise RuntimeError(
-            "图片 OCR 依赖未安装。请运行 uv sync --extra ui --extra media。"
+            "图片 OCR 依赖未安装。macOS 请安装 ui/media，Windows 请安装 windows/media。"
         ) from exc
     blocks = recognize_text(path)
     lines = [block.text.strip() for block in blocks if block.text.strip()]
     confidences = [block.confidence for block in blocks if block.text.strip()]
+    width = height = None
+    try:
+        from PIL import Image
+        with Image.open(path) as image:
+            width, height = image.size
+    except (ImportError, OSError):
+        pass
+    text = "\n".join(lines)
+    screenshot_signals = []
+    if len(lines) >= 3:
+        screenshot_signals.append("multiple_text_lines")
+    if len(text) >= 40:
+        screenshot_signals.append("dense_text")
+    if width and height and (height / width >= 1.45 or width / height >= 1.7):
+        screenshot_signals.append("screen_like_aspect_ratio")
+    visual_kind = (
+        "screenshot_candidate"
+        if len(screenshot_signals) >= 2 or "dense_text" in screenshot_signals
+        else "image"
+    )
     return {
-        "text": "\n".join(lines),
-        "engine": "macos_vision",
+        "text": text,
+        "engine": engine,
         "confidence": (
             round(sum(confidences) / len(confidences), 4)
             if confidences
             else 0.0
         ),
         "blocks": [block.model_dump() for block in blocks],
+        "visual_kind": visual_kind,
+        "classification": {
+            "heuristic": True,
+            "signals": screenshot_signals,
+            "width": width,
+            "height": height,
+        },
     }
+
+
+def _looks_like_image(path: Path) -> bool:
+    try:
+        head = path.read_bytes()[:16]
+    except OSError:
+        return False
+    return (
+        head.startswith((b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF87a", b"GIF89a"))
+        or (head.startswith(b"RIFF") and head[8:12] == b"WEBP")
+    )
+
+
+def _sticker_candidates(account: Path, md5: str, timestamp: int) -> list[Path]:
+    if not md5 or len(md5) < 2:
+        return []
+    month = datetime.fromtimestamp(timestamp).strftime("%Y-%m")
+    prefix = md5[:2]
+    candidates = [
+        account / "cache" / month / "Emoticon" / prefix / md5,
+        account / "business" / "emoticon" / "Persist" / prefix / md5,
+        account / "business" / "emoticon" / "PersistStore" / prefix / md5,
+        account / "business" / "emoticon" / "Thumb" / prefix / f"{md5}.thumb",
+    ]
+    return [path for path in candidates if path.is_file() and _looks_like_image(path)]
+
+
+@lru_cache(maxsize=4096)
+def _sticker_caption(snapshot: Path, md5: str) -> str:
+    path = snapshot / "emoticon/emoticon.db"
+    if not path.is_file() or not md5:
+        return ""
+    try:
+        with _read_only_connect(path) as connection:
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "kNonStoreEmoticonTable" in tables:
+                row = connection.execute(
+                    "SELECT caption FROM kNonStoreEmoticonTable "
+                    "WHERE lower(md5) = lower(?) AND length(caption) > 0 LIMIT 1",
+                    (md5,),
+                ).fetchone()
+                if row and str(row["caption"] or "").strip():
+                    return str(row["caption"]).strip()
+            if "kStoreEmoticonCaptionsTable" in tables:
+                row = connection.execute(
+                    "SELECT caption_ FROM kStoreEmoticonCaptionsTable "
+                    "WHERE lower(md5_) = lower(?) AND length(caption_) > 0 "
+                    "ORDER BY CASE lower(language_) WHEN 'zh_cn' THEN 0 "
+                    "WHEN 'zh-cn' THEN 1 WHEN 'default' THEN 2 ELSE 3 END LIMIT 1",
+                    (md5,),
+                ).fetchone()
+                if row:
+                    return str(row["caption_"] or "").strip()
+    except sqlite3.Error:
+        return ""
+    return ""
 
 
 def _voice_blob(
@@ -188,21 +293,25 @@ def _transcribe_voice(
     # Xet opens many parallel connections and can stall on managed/corporate
     # networks. Standard Hugging Face HTTPS downloads are slower but reliable.
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-    try:
-        import mlx_whisper
-    except ImportError as exc:
-        raise RuntimeError(
-            "本地语音识别依赖未安装。请运行 uv sync --extra media。"
-        ) from exc
     with _voice_wav(voice_data) as wav_path:
-        result = mlx_whisper.transcribe(
-            str(wav_path),
-            path_or_hf_repo=model,
-            language=language,
-            task="transcribe",
-            verbose=False,
-            condition_on_previous_text=False,
-        )
+        if sys.platform == "darwin" and platform.machine() == "arm64":
+            try:
+                import mlx_whisper
+            except ImportError:
+                result = _transcribe_faster_whisper(wav_path, language, model)
+            else:
+                result = mlx_whisper.transcribe(
+                    str(wav_path),
+                    path_or_hf_repo=model,
+                    language=language,
+                    task="transcribe",
+                    verbose=False,
+                    condition_on_previous_text=False,
+                )
+                result["engine"] = "mlx_whisper"
+                result["model"] = model
+        else:
+            result = _transcribe_faster_whisper(wav_path, language, model)
     text = str(result.get("text") or "").strip()
     segments = result.get("segments") or []
     log_probabilities = [
@@ -218,8 +327,8 @@ def _transcribe_voice(
     )
     return {
         "text": text,
-        "engine": "mlx_whisper",
-        "model": model,
+        "engine": str(result.get("engine") or "local_whisper"),
+        "model": str(result.get("model") or model),
         "language": str(result.get("language") or language),
         "confidence": confidence,
         "review_required": True,
@@ -233,6 +342,51 @@ def _transcribe_voice(
             if isinstance(segment, dict)
         ],
     }
+
+
+def _transcribe_faster_whisper(
+    wav_path: Path, language: str, configured_model: str
+) -> dict[str, Any]:
+    model_name = os.environ.get("WECHAT_FASTER_WHISPER_MODEL", "").strip()
+    if not model_name:
+        model_name = (
+            "small" if configured_model.startswith("mlx-community/")
+            else configured_model
+        )
+    whisper = _faster_whisper_engine(model_name)
+    segment_iter, info = whisper.transcribe(
+        str(wav_path),
+        language=language,
+        task="transcribe",
+        condition_on_previous_text=False,
+    )
+    segments = list(segment_iter)
+    return {
+        "text": " ".join(str(segment.text).strip() for segment in segments).strip(),
+        "engine": "faster_whisper",
+        "model": model_name,
+        "language": str(getattr(info, "language", language) or language),
+        "segments": [
+            {
+                "start": segment.start,
+                "end": segment.end,
+                "text": str(segment.text).strip(),
+                "avg_logprob": getattr(segment, "avg_logprob", None),
+            }
+            for segment in segments
+        ],
+    }
+
+
+@lru_cache(maxsize=2)
+def _faster_whisper_engine(model_name: str) -> Any:
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "本地语音识别依赖未安装。请运行 uv sync --extra media。"
+        ) from exc
+    return WhisperModel(model_name, device="auto", compute_type="int8")
 
 
 class MediaTextExtractor:
@@ -274,13 +428,23 @@ class MediaTextExtractor:
             "image_cache_available": bool(
                 self.account and (self.account / "cache").is_dir()
             ),
-            "pilk_installed": importlib.util.find_spec("pilk") is not None,
+            "pilk_installed": _has_module("pilk"),
             "mlx_whisper_installed": (
-                importlib.util.find_spec("mlx_whisper") is not None
+                _has_module("mlx_whisper")
+            ),
+            "faster_whisper_installed": (
+                _has_module("faster_whisper")
             ),
             "vision_ocr_installed": (
-                importlib.util.find_spec("Vision") is not None
+                _has_module("Vision")
             ),
+            "windows_ocr_installed": (
+                _has_module("winrt.windows.media.ocr")
+                if sys.platform == "win32" else False
+            ),
+            "sticker_database_available": (
+                self.snapshot / "emoticon/emoticon.db"
+            ).is_file(),
             "cached_text_items": cached_count,
             "privacy": {
                 "audio_uploaded": False,
@@ -303,15 +467,20 @@ class MediaTextExtractor:
         local_id = int(message["local_id"])
         timestamp = int(message["timestamp"])
         base_type, _ = split_type(message["local_type"])
-        if base_type not in (3, 34):
-            raise ValueError("message is not an image or voice message")
-        kind = "image" if base_type == 3 else "voice"
+        if base_type not in (3, 34, 47):
+            raise ValueError("message is not an image, voice, or sticker message")
+        kind = {3: "image", 34: "voice", 47: "sticker"}[base_type]
         username = str(chat["username"])
-        engine_key = (
-            f"{model}:{language}"
-            if kind == "voice"
-            else "macos_vision"
-        )
+        if kind == "voice":
+            faster_model = os.environ.get("WECHAT_FASTER_WHISPER_MODEL", "")
+            engine_key = (
+                f"{model}:{faster_model}:{language}:"
+                f"{sys.platform}:{platform.machine()}"
+            )
+        elif kind == "image":
+            engine_key = f"ocr:{sys.platform}:screenshot-v1"
+        else:
+            engine_key = f"sticker:{sys.platform}:caption-v1"
         key = _cache_key(
             chat_username=username,
             local_id=local_id,
@@ -348,13 +517,26 @@ class MediaTextExtractor:
                     raise RuntimeError(
                         "本地没有该图片缓存。请在微信中打开一次原图后重试。"
                     )
-                derived = _ocr_image(candidates[0])
+                derived = None
+                selected = None
+                last_error = None
+                for candidate in candidates:
+                    try:
+                        derived = _ocr_image(candidate)
+                        selected = candidate
+                        break
+                    except RuntimeError as exc:
+                        last_error = exc
+                if derived is None or selected is None:
+                    raise RuntimeError(
+                        f"本地图片缓存无法识别：{last_error or '未知图片格式'}"
+                    )
                 result = base | {
                     "status": "ok",
-                    "media_source": str(candidates[0]),
+                    "media_source": str(selected),
                     "derived_text": derived,
                 }
-            else:
+            elif kind == "voice":
                 voice_data = _voice_blob(
                     self.snapshot,
                     username,
@@ -371,6 +553,52 @@ class MediaTextExtractor:
                 result = base | {
                     "status": "ok",
                     "media_source": "decrypted_snapshot:media_0.db",
+                    "derived_text": derived,
+                }
+            else:
+                metadata = message.get("sticker") or {}
+                md5 = str(metadata.get("md5") or "").strip().lower()
+                xml_label = str(metadata.get("label") or "").strip()
+                database_label = _sticker_caption(self.snapshot, md5)
+                label = xml_label or database_label
+                candidate = None
+                ocr = None
+                if self.account is not None:
+                    candidates = _sticker_candidates(
+                        self.account, md5, timestamp
+                    )
+                    candidate = candidates[0] if candidates else None
+                    if candidate is not None:
+                        try:
+                            ocr = _ocr_image(candidate)
+                        except RuntimeError:
+                            ocr = None
+                ocr_text = str((ocr or {}).get("text") or "").strip()
+                parts = list(dict.fromkeys(part for part in (label, ocr_text) if part))
+                if not parts:
+                    raise RuntimeError(
+                        "本地表情说明为空，且没有找到可直接识别的明文表情缓存。"
+                    )
+                sources = []
+                if xml_label:
+                    sources.append("message_metadata")
+                elif database_label:
+                    sources.append("local_sticker_database")
+                if ocr_text:
+                    sources.append("local_sticker_ocr")
+                derived = {
+                    "text": "\n".join(parts),
+                    "engine": "+".join(sources),
+                    "confidence": (ocr or {}).get("confidence"),
+                    "review_required": True,
+                    "recognition_status": "recognized",
+                    "metadata": metadata,
+                }
+                if ocr:
+                    derived["ocr"] = ocr
+                result = base | {
+                    "status": "ok",
+                    "media_source": str(candidate) if candidate else "local_sticker_metadata",
                     "derived_text": derived,
                 }
             _write_json(cache_path, result)
@@ -392,12 +620,12 @@ class MediaTextExtractor:
         model: str,
         refresh: bool = False,
     ) -> list[dict[str, Any]]:
-        """Automatically replace image/voice placeholders with derived text."""
+        """Automatically replace image/voice/sticker placeholders with derived text."""
 
         enriched: list[dict[str, Any]] = []
         for message in messages:
             base_type, _ = split_type(message.get("local_type"))
-            if base_type not in (3, 34):
+            if base_type not in (3, 34, 47):
                 enriched.append(message)
                 continue
             chat = message.get("chat") or default_chat
@@ -427,9 +655,18 @@ class MediaTextExtractor:
             text = str(derived.get("text") or "").strip()
             if result.get("status") == "ok" and text:
                 item["content"] = text
-                item["content_source"] = (
-                    "image_ocr" if base_type == 3 else "voice_transcript"
-                )
+                if base_type == 3:
+                    visual_kind = str(derived.get("visual_kind") or "image")
+                    item["message_kind"] = visual_kind
+                    item["content_source"] = (
+                        "screenshot_ocr"
+                        if visual_kind == "screenshot_candidate"
+                        else "image_ocr"
+                    )
+                elif base_type == 34:
+                    item["content_source"] = "voice_transcript"
+                else:
+                    item["content_source"] = "sticker_recognition"
             enriched.append(item)
         return enriched
 
