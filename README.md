@@ -147,6 +147,35 @@ export WECHAT_KEYS_FILE="$HOME/.config/wechat-local-mcp/keys.json"
 
 ## 配置 MCP
 
+### Claude Code
+
+先在仓库目录完成依赖安装，然后运行：
+
+```bash
+chmod +x scripts/install_claude_code.sh
+./scripts/install_claude_code.sh
+```
+
+脚本会把 `wechat-local-mcp` 注册到 Claude Code 的用户级配置，并直接调用
+`.venv/bin/wechat-local-mcp`。它不会用 `uv run` 作为 MCP 启动命令，避免 Claude
+Code 握手时因依赖同步、网络或 uv 缓存权限而超时。
+
+完全退出并重新打开 Claude Code，在会话中运行 `/mcp`，应看到
+`wechat-local-mcp` 为 `connected`。也可以在终端检查：
+
+```bash
+claude mcp get wechat-local-mcp
+```
+
+仓库还包含项目级 `.mcp.json`。直接在本仓库启动 Claude Code 时，首次会询问
+是否信任此项目和 MCP；选择使用该 MCP 即可。配置通过
+`${CLAUDE_PROJECT_DIR}` 定位虚拟环境，不包含开发者机器的绝对路径。
+
+如果显示 `Pending approval`，请在本仓库运行 `claude` 并批准该 MCP；如果显示
+`Failed to connect`，先确认 `.venv/bin/wechat-local-mcp --help` 可以正常运行。
+
+### 其他 MCP 客户端
+
 以 stdio 方式添加到支持 MCP 的客户端：
 
 ```json

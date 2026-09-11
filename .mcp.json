@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "wechat-local-mcp": {
+      "type": "stdio",
+      "command": "${CLAUDE_PROJECT_DIR}/.venv/bin/wechat-local-mcp",
+      "args": [
+        "--transport",
+        "stdio"
+      ]
+    }
+  }
+}
