@@ -1,5 +1,9 @@
 # wechat-local-mcp
 
+![wechat-local-mcp：Claude Code 通过 MCP 调用 wechat_find_todos 和 wechat_read_chat，按群整理本周未完成的待办](docs/assets/hero.jpg)
+
+<sub>示意图中的聊天、群名和人名均为虚构的演示数据。工具调用、返回内容和回答取自一次真实的 Claude Code 会话记录（只读取演示快照），窗口为重新排版。</sub>
+
 一个只读的本地 MCP 服务，用来把你自己的 macOS 或 Windows 微信聊天变成可搜索、可提取待办的上下文。
 
 它分成四层：
