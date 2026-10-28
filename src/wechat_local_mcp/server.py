@@ -382,10 +382,13 @@ def wechat_find_todos_ui(chat: str, limit: int = 80, scroll_pages: int = 3, min_
 @mcp.tool(
     name="wechat_sync",
     title="同步本地微信数据库快照",
-    description="将本机微信 db_storage 中有对应 64 位十六进制密钥的数据库，解密到独立的本地只读快照目录。不会修改微信源文件、不会发送消息。建议退出微信后执行。",
+    description="增量同步本机数据库到独立快照。默认 profile=chat 仅解密联系人和消息；media 加上语音/表情库；all 解密所有库。跳过未变化文件。dry_run=true 预估工作量，force=true 强制重建。必须先完全退出微信；不会修改源文件或发送消息。",
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-def wechat_sync(key_file: str | None = None, output_dir: str | None = None) -> JsonToolResult:
+def wechat_sync(
+    key_file: str | None = None, output_dir: str | None = None,
+    profile: str = "chat", force: bool = False, dry_run: bool = False,
+) -> JsonToolResult:
     p = paths()
     account = account_dir(p.container)
     if account is None:
@@ -400,8 +403,14 @@ def wechat_sync(key_file: str | None = None, output_dir: str | None = None) -> J
         }, "json")
     keys = load_keys(target_keys)
     target_dir = Path(output_dir).expanduser() if output_dir else p.decrypted_dir
-    result = sync_databases(account / "db_storage", keys, target_dir)
-    result["ready"] = (target_dir / "contact/contact.db").exists() and bool(list((target_dir / "message").glob("message_*.db")))
+    try:
+        result = sync_databases(account / "db_storage", keys, target_dir, profile=profile, force=force, dry_run=dry_run)
+    except (OSError, ValueError, RuntimeError) as exc:
+        return output({"ready": False, "complete": False, "error": str(exc)}, "json")
+    result["snapshot_available"] = (target_dir / "contact/contact.db").exists() and bool(list((target_dir / "message").glob("message_*.db")))
+    result["ready"] = result["snapshot_available"] and result["complete"] and not dry_run
+    if any(item["code"] == "source_busy" for item in result["failed"]):
+        result["next_step"] = "完全退出微信后重试；不要删除微信的 WAL 文件。旧快照可能仍可查询，但本次未完整更新。"
     return output(result, "json")
 
 
@@ -597,3 +606,7 @@ def main() -> None:
         mcp.run()
     else:
         mcp.run(transport="streamable-http")
+
+
+if __name__ == "__main__":
+    main()

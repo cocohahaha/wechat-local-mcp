@@ -1,6 +1,6 @@
 [project]
 name = "wechat-local-mcp"
-version = "0.4.1"
+version = "0.5.0"
 description = "Read-only MCP server for a user's local WeChat chats on macOS and Windows"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -45,6 +45,7 @@ Issues = "https://github.com/cocohahaha/wechat-local-mcp/issues"
 [project.scripts]
 wechat-local-mcp = "wechat_local_mcp.server:main"
 wechat-local-sync = "wechat_local_mcp.cli:main"
+wechat-local-setup = "wechat_local_mcp.setup:main"
 
 [build-system]
 requires = ["hatchling"]

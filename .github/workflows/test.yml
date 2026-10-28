@@ -1,0 +1,28 @@
+name: MCP portability tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  base-install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Minimal locked installation (no media or UI extras)
+        run: uv sync --locked --python 3.12 --extra test
+      - name: Regression tests including real stdio handshake
+        run: uv run --locked --no-sync python -m pytest -q
+      - name: Bootstrap without touching client configuration
+        run: uv run --locked --no-sync python -m wechat_local_mcp.setup bootstrap
+      - name: Unix installer smoke test (configuration only)
+        if: runner.os != 'Windows'
+        run: bash scripts/install.sh
+      - name: Windows installer smoke test (configuration only)
+        if: runner.os == 'Windows'
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install_windows.ps1

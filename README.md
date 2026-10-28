@@ -2,6 +2,14 @@
 
 一个只读的本地 MCP 服务，用来把你自己的 macOS 或 Windows 微信聊天变成可搜索、可提取待办的上下文。
 
+## 把链接交给你的 Agent
+
+请让 Agent 先读 [INSTALL.md：安装、验证与排障](INSTALL.md)。它可以从全新克隆开始，生成适合当前电脑的配置，并自动验证 MCP 握手。Claude Code、Codex 以及支持 stdio 的客户端均可接入。
+
+**v0.5.0：默认轻量安装；默认只同步聊天必需库；未变化文件直接跳过；中断可续；每次同步返回耗时和处理量。** 第一次大数据库仍需解密；这是文件级增量，不是实时监听或 WAL 重放。详见 [性能说明与可复现测试](PERFORMANCE.md)。
+
+MCP 接通不等于完整历史已就绪：精确历史需要你自己的密钥或明文快照；没有密钥可先使用可选的窗口 OCR。Windows 暂不提供自动密钥捕获，微信版本升级也可能影响兼容性。
+
 它分成四层：
 
 1. 精确历史层：把已获得密钥的本地数据库解密成独立快照，再进行全文搜索和待办提取。
@@ -35,28 +43,27 @@ Windows 微信 4.x 的账号数据通常位于“文档”目录下的 `xwechat_
 
 ### macOS
 
-在本目录执行：
+已有 Claude Code 和 [uv](https://docs.astral.sh/uv/) 时，在仓库目录执行：
 
 ```bash
-uv sync --extra keys --extra ui --extra media --extra test --python /opt/homebrew/bin/python3.12
+bash scripts/install_claude_code.sh
 ```
 
-查看状态：
+脚本仅安装基础依赖并验证、注册 MCP，不下载语音模型，不改微信，不解密聊天。已有不同配置时会停止并保留原配置。其他客户端先生成配置：
 
 ```bash
-uv run --python /opt/homebrew/bin/python3.12 wechat-local-sync status
+bash scripts/install.sh
 ```
 
 ### Windows 10/11
 
-安装 Python 3.11 或 3.12 与 [uv](https://docs.astral.sh/uv/)，然后在 PowerShell 中运行：
+安装 [uv](https://docs.astral.sh/uv/)，然后在 PowerShell 中运行（uv 可按需安装 Python 3.12）：
 
 ```powershell
-uv sync --extra windows --extra media --extra test --python 3.12
-uv run wechat-local-mcp --transport stdio
+powershell -ExecutionPolicy Bypass -File scripts/install_windows.ps1 -Client claude -Register
 ```
 
-也可以直接运行 `powershell -ExecutionPolicy Bypass -File scripts/install_windows.ps1` 完成依赖安装和离线测试。
+省略 `-Register` 只检查并生成配置；换成 `-Client codex -Register` 可注册到 Codex。`-WithUI` 按需安装窗口 OCR，`-WithMedia` 按需安装语音与图片依赖，默认都不安装。每条命令失败都会停止，不会误报成功。
 
 Windows UI 读取使用系统自带的 `Windows.Media.Ocr`，截图只存在于进程的临时目录，识别结束后自动删除，不调用云端 OCR。若诊断提示没有中文 OCR，请在“设置 → 时间和语言 → 语言和区域”中安装简体中文语言功能。
 
@@ -78,13 +85,13 @@ Windows UI 读取使用系统自带的 `Windows.Media.Ocr`，截图只存在于�
 如果没有 keys 文件，项目附带一个不改日常微信安装包的 Frida 辅助脚本。先安装可选依赖：
 
 ```bash
-uv sync --extra keys --python /opt/homebrew/bin/python3.12
+uv sync --locked --inexact --extra keys --python 3.12
 ```
 
 直接附加日常微信在部分 macOS 版本上会被系统拒绝。如果本机允许附加，可以退出并重新打开微信后运行：
 
 ```bash
-uv run --python /opt/homebrew/bin/python3.12 python scripts/capture_keys.py \
+.venv/bin/python scripts/capture_keys.py \
   --pid "$(pgrep -x WeChat | head -1)" \
   --db-dir "$HOME/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/<账号>/db_storage"
 ```
@@ -127,15 +134,20 @@ zsh scripts/prepare_capture_copy.sh
 
 ## 解密本地快照
 
-建议先完全退出微信，再执行：
+先完全退出微信，再执行（Windows 将 `.venv/bin/python` 换成 `.venv\Scripts\python.exe`）：
 
 ```bash
-uv run --python /opt/homebrew/bin/python3.12 wechat-local-sync sync
+.venv/bin/python -m wechat_local_mcp.cli sync --dry-run
+.venv/bin/python -m wechat_local_mcp.cli sync
 ```
 
 默认输出到：
 
 `~/Library/Application Support/wechat-local-vault/decrypted/current/`
+
+默认 `--profile chat` 只处理 `contact/contact.db` 和 `message/message_<数字>.db`。需要语音/表情时用 `--profile media`，所有数据库用 `--profile all`。未变化文件会跳过；`--force` 强制重建。进度写到 stderr，stdout 始终是 JSON；非完整同步退出码为 2。不要因看到 `count=0` 就认为失败：查看 `unchanged_count` 和 `complete`。
+
+如有多个账号，CLI 用 `--db-dir /实际账号/db_storage --out /该账号专用快照目录` 明确选择。快照目录不要混用不同账号。存在非空 WAL/journal 时会保留旧快照并提示退出微信，绝不删除微信日志。首次升级会重建一次缓存清单。
 
 也可以通过环境变量覆盖：
 
@@ -152,12 +164,11 @@ export WECHAT_KEYS_FILE="$HOME/.config/wechat-local-mcp/keys.json"
 先在仓库目录完成依赖安装，然后运行：
 
 ```bash
-chmod +x scripts/install_claude_code.sh
-./scripts/install_claude_code.sh
+bash scripts/install_claude_code.sh
 ```
 
 脚本会把 `wechat-local-mcp` 注册到 Claude Code 的用户级配置，并直接调用
-`.venv/bin/wechat-local-mcp`。它不会用 `uv run` 作为 MCP 启动命令，避免 Claude
+当前虚拟环境 Python 的绝对路径。它不会用 `uv run` 作为 MCP 启动命令，避免 Claude
 Code 握手时因依赖同步、网络或 uv 缓存权限而超时。
 
 完全退出并重新打开 Claude Code，在会话中运行 `/mcp`，应看到
@@ -167,48 +178,29 @@ Code 握手时因依赖同步、网络或 uv 缓存权限而超时。
 claude mcp get wechat-local-mcp
 ```
 
-仓库还包含项目级 `.mcp.json`。直接在本仓库启动 Claude Code 时，首次会询问
-是否信任此项目和 MCP；选择使用该 MCP 即可。配置通过
-`${CLAUDE_PROJECT_DIR}` 定位虚拟环境，不包含开发者机器的绝对路径。
+仓库不再附带仅适用 macOS 的项目级 `.mcp.json`，避免覆盖 Windows 或用户级配置。安装向导会为当前电脑生成绝对路径配置，不包含开发者机器路径。移动仓库或虚拟环境后需要更新客户端配置。已有旧 `.mcp.json` 的用户请检查是否存在同名覆盖。
 
 如果显示 `Pending approval`，请在本仓库运行 `claude` 并批准该 MCP；如果显示
-`Failed to connect`，先确认 `.venv/bin/wechat-local-mcp --help` 可以正常运行。
+`Failed to connect`，先重新执行 `python -m wechat_local_mcp.setup bootstrap`（使用虚拟环境的 Python）。
 
 ### 其他 MCP 客户端
 
-以 stdio 方式添加到支持 MCP 的客户端：
-
-```json
-{
-  "mcpServers": {
-    "wechat-local": {
-      "command": "/绝对路径/outputs/wechat-local-mcp/.venv/bin/wechat-local-mcp",
-      "args": ["--transport", "stdio"]
-    }
-  }
-}
-```
-
-或直接运行：
+运行以下命令，把输出中的 `mcpServers` 对象交给客户端配置界面：
 
 ```bash
-uv run --python /opt/homebrew/bin/python3.12 wechat-local-mcp --transport stdio
+.venv/bin/python -m wechat_local_mcp.setup bootstrap --client config
 ```
 
 Codex CLI 可直接注册：
 
 ```bash
-codex mcp add wechat-local -- \
-  "/绝对路径/outputs/wechat-local-mcp/.venv/bin/wechat-local-mcp" \
-  --transport stdio
+.venv/bin/python -m wechat_local_mcp.setup bootstrap --client codex --register
 ```
 
 Windows PowerShell 示例：
 
 ```powershell
-codex mcp add wechat-local -- `
-  "$PWD\.venv\Scripts\wechat-local-mcp.exe" `
-  --transport stdio
+.venv\Scripts\python.exe -m wechat_local_mcp.setup bootstrap --client codex --register
 ```
 
 ## 响应格式
@@ -223,7 +215,7 @@ codex mcp add wechat-local -- `
 ## 可用工具
 
 - `wechat_status`：检查微信版本、数据库、密钥与快照状态。
-- `wechat_sync`：按 keys.json 解密数据库到独立快照目录。
+- `wechat_sync`：按 keys.json 增量解密数据库到独立快照目录，支持 `profile` / `dry_run` / `force`。
 - `wechat_list_chats`：列出联系人和群聊，支持分页。
 - `wechat_read_chat`：按昵称、备注、群名或微信 ID 读取消息，并自动理解图片、截图、表情包、语音及合并转发消息。
 - `wechat_search_messages`：按关键词、聊天和时间范围搜索普通消息及已自动转换的媒体文字。
@@ -243,8 +235,8 @@ codex mcp add wechat-local -- `
 先准备最新明文快照并安装媒体依赖：
 
 ```bash
-uv run --python /opt/homebrew/bin/python3.12 wechat-local-sync sync
-uv sync --extra ui --extra media --python /opt/homebrew/bin/python3.12
+.venv/bin/python -m wechat_local_mcp.cli sync --profile media
+uv sync --locked --inexact --extra ui --extra media --python 3.12
 ```
 
 直接调用原来的消息读取工具，无需先调用单独的媒体工具：
@@ -285,7 +277,7 @@ export WECHAT_MEDIA_TEXT_DIR="$HOME/Library/Application Support/wechat-local-vau
 macOS OCR 兜底需要：
 
 ```bash
-uv sync --extra ui --python /opt/homebrew/bin/python3.12
+uv sync --locked --inexact --extra ui --python 3.12
 ```
 
 并在系统设置中允许运行 MCP 的终端使用“屏幕与系统音频录制”。OCR 是当前屏幕的近似读取，长期历史、精确 sender 和全文搜索仍以数据库快照后端为准。
@@ -293,7 +285,7 @@ uv sync --extra ui --python /opt/homebrew/bin/python3.12
 Windows OCR 兜底需要：
 
 ```powershell
-uv sync --extra windows --python 3.12
+uv sync --locked --inexact --extra windows --python 3.12
 ```
 
 支持新版 `Weixin.exe` 和旧版 `WeChat.exe`。调用读取工具时应保持微信已登录、主窗口未最小化；工具可能把微信切到前台、打开指定聊天并向上滚动，但不会在输入框发送内容。OCR 是当前窗口的近似读取，长期历史、精确 sender 和全文搜索仍以数据库快照后端为准。
@@ -301,15 +293,17 @@ uv sync --extra windows --python 3.12
 ## 验证
 
 ```bash
-uv run --python /opt/homebrew/bin/python3.12 pytest
-uv run --python /opt/homebrew/bin/python3.12 wechat-local-sync status
+uv sync --locked --inexact --extra test --python 3.12
+.venv/bin/python -m pytest
+.venv/bin/python -m wechat_local_mcp.setup bootstrap
 ```
 
 Windows：
 
 ```powershell
-uv run pytest
-uv run wechat-local-sync status
+uv sync --locked --inexact --extra test --python 3.12
+.venv\Scripts\python.exe -m pytest
+.venv\Scripts\python.exe -m wechat_local_mcp.setup bootstrap
 ```
 
 若没有明文快照，MCP 会返回下一步提示，不会把加密数据库误当成可读内容。

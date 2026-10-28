@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
+
+from wechat_local_mcp.setup import server_config
 
 
 def test_project_mcp_config_uses_direct_portable_stdio_command() -> None:
     root = Path(__file__).parents[1]
-    config = json.loads((root / ".mcp.json").read_text(encoding="utf-8"))
-    server = config["mcpServers"]["wechat-local-mcp"]
-
-    assert server == {
-        "type": "stdio",
-        "command": "${CLAUDE_PROJECT_DIR}/.venv/bin/wechat-local-mcp",
-        "args": ["--transport", "stdio"],
-    }
+    # Never ship a POSIX-only project config that shadows user-scope Windows config.
+    assert not (root / ".mcp.json").exists()
+    server = server_config()
+    assert Path(server["command"]).is_absolute()
+    assert server["type"] == "stdio"
+    assert server["args"] == ["-m", "wechat_local_mcp.server", "--transport", "stdio"]
     assert "uv" not in server["command"]

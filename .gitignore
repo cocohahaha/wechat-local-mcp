@@ -17,3 +17,6 @@ keys*.json
 *.sqlite3
 decrypted/
 vault/
+.mcp.json
+.sync-manifest.json
+.sync.lock

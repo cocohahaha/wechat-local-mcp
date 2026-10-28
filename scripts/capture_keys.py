@@ -50,7 +50,8 @@ def salt_map(db_root: Path) -> dict[str, str]:
     out = {}
     for path in sorted(db_root.rglob("*.db")):
         try:
-            data = path.read_bytes()[:16]
+            with path.open("rb") as stream:
+                data = stream.read(16)
         except OSError:
             continue
         if len(data) == 16 and data[:16] != b"SQLite format 3\x00":
