@@ -67,7 +67,7 @@ Claude Code 注册遵循[官方 MCP 文档](https://code.claude.com/docs/en/mcp)
 | 用户已有的条件 | 下一步 | 能做到什么 |
 | --- | --- | --- |
 | 已解密快照 | 将 `--decrypted-dir` 指向含 `contact/`、`message/` 的快照目录 | 精确历史查询；不必重新解密 |
-| 当前账号有效 keys.json | 完全退出微信，按第 4 步同步 | 精确历史查询 |
+| 当前账号有效 keys.json | 按第 4 步同步（微信可保持运行） | 精确历史查询 |
 | 没有密钥 | 按需安装 `ui`（macOS）或 `windows`（Windows），调用 `wechat_ui_diagnose` | 当前可见窗口 OCR，不等于完整历史 |
 | 需要首次获取密钥 | 读 README 的一次性密钥准备；macOS 才有附带捕获辅助脚本 | 受微信版本和本机权限限制，不保证一次成功 |
 
@@ -92,7 +92,7 @@ Windows 4.x 数据路径可能是自定义目录或重定向的“文档”目�
 
 检查 JSON：`complete=true`，并查看 `decrypted`、`unchanged`、`skipped_no_key`、`failed`、`elapsed_seconds`、`bytes_processed`。`count=0` 且 `unchanged_count>0` 是正常的快速同步。失败返回退出码 2；`dry_run` 只是计划，不代表快照已创建。
 
-检测到非空 WAL/journal 会报告 `source_busy`。先完全退出微信，让微信正常落盘，再重试；**不要删除 WAL 文件**，它可能包含尚未保存的新消息。已有快照会保留，但不能声称它已更新。若正常退出后仍有日志，保留现场排查，不绕过检查。
+微信可以保持运行：带非空 WAL 的库会被只读复制（连同 WAL）到临时目录，按 SQLite 规则回放已提交的帧后再解密，返回结果里的 `wal_replayed` 会列出每个库回放的帧数。只有复制期间微信持续写入、或存在未提交的回滚日志（`-journal`）时才报告 `source_busy`，稍后重试即可，仍失败再完全退出微信。**不要删除 WAL 文件**，它可能包含尚未保存的新消息。已有快照会保留，但不能声称它已更新。
 
 首次仍需读取每个选中库；后续只处理变化的文件。文件正在解密时中断，该文件下次重做，已经完成的文件会跳过。更换密钥、源文件变化、输出丢失/变化、缓存损坏均会触发重建。详见 [PERFORMANCE.md](PERFORMANCE.md)。
 

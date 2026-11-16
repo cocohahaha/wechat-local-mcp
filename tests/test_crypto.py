@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -242,3 +243,70 @@ def test_output_write_during_decrypt_preserves_previous_snapshot(tmp_path, monke
     result = crypto.sync_databases(root, keys, out, force=True)
     assert result["failed"][0]["code"] == "output_busy"
     assert (out / "contact.db").read_bytes() == previous
+
+
+def live_wal_db(directory: Path) -> tuple[sqlite3.Connection, Path]:
+    """A plaintext WAL database whose newest rows exist only in the -wal file."""
+    work = directory / "live"
+    work.mkdir(parents=True, exist_ok=True)
+    path = work / "message_0.db"
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA wal_autocheckpoint=0")
+    connection.execute("CREATE TABLE t(v TEXT)")
+    connection.execute("INSERT INTO t VALUES ('checkpointed')")
+    connection.commit()
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    for index in range(50):
+        connection.execute("INSERT INTO t VALUES (?)", (f"in-wal-{index}-" + "x" * 300,))
+    connection.commit()
+    return connection, path
+
+
+def test_live_wal_is_replayed_without_touching_source(tmp_path):
+    connection, live = live_wal_db(tmp_path)
+    root, out = tmp_path / "source", tmp_path / "out"
+    (root / "message").mkdir(parents=True)
+    source = root / "message/message_0.db"
+    shutil.copyfile(live, source)
+    shutil.copyfile(str(live) + "-wal", str(source) + "-wal")
+    connection.close()
+    before = (source.read_bytes(), Path(str(source) + "-wal").read_bytes())
+
+    result = crypto.sync_databases(root, {}, out)
+
+    assert result["failed"] == [] and result["decrypted"] == ["message/message_0.db"]
+    assert result["wal_replayed"][0]["committed_frames"] > 0
+    with sqlite3.connect(out / "message/message_0.db") as db:
+        assert db.execute("SELECT count(*) FROM t").fetchone() == (51,)
+    assert (source.read_bytes(), Path(str(source) + "-wal").read_bytes()) == before
+    second = crypto.sync_databases(root, {}, out)
+    assert second["unchanged"] == ["message/message_0.db"]
+
+
+def test_torn_wal_tail_and_stale_salt_are_ignored(tmp_path):
+    connection, live = live_wal_db(tmp_path)
+    root, out = tmp_path / "source", tmp_path / "out"
+    (root / "message").mkdir(parents=True)
+    source = root / "message/message_0.db"
+    shutil.copyfile(live, source)
+    wal = bytearray(Path(str(live) + "-wal").read_bytes())
+    connection.close()
+    page_size = int.from_bytes(wal[8:12], "big")
+    wal += wal[32:32 + 24 + page_size // 2]  # half-written trailing frame
+    Path(str(source) + "-wal").write_bytes(bytes(wal))
+    result = crypto.sync_databases(root, {}, out)
+    assert result["failed"] == []
+    with sqlite3.connect(out / "message/message_0.db") as db:
+        assert db.execute("SELECT count(*) FROM t").fetchone() == (51,)
+
+    stale = bytearray(wal)
+    stale[16:24] = b"\x01" * 8  # new salt in header: every frame belongs to an older generation
+    from wechat_local_mcp.crypto import _wal_checksum
+    import struct as _struct
+    stale[24:32] = _struct.pack(">II", *_wal_checksum(bytes(stale[:24]), "<" if stale[:4] == b"\x37\x7f\x06\x82" else ">"))
+    Path(str(source) + "-wal").write_bytes(bytes(stale))
+    result = crypto.sync_databases(root, {}, out, force=True)
+    assert result["wal_replayed"][0]["committed_frames"] == 0
+    with sqlite3.connect(out / "message/message_0.db") as db:
+        assert db.execute("SELECT count(*) FROM t").fetchone() == (1,)

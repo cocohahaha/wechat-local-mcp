@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import sqlite3
+import struct
 import tempfile
 import time
 from contextlib import contextmanager, nullcontext
@@ -20,6 +21,11 @@ RESERVE_SIZE = 80
 SQLITE_HEADER = b"SQLite format 3\x00"
 CHUNK_SIZE = 1024 * 1024
 MANIFEST_VERSION = 1
+WAL_HEADER_SIZE = 32
+WAL_FRAME_HEADER_SIZE = 24
+WAL_MAGICS = {0x377F0682: "<", 0x377F0683: ">"}
+WAL_VERSION = 3007000
+WAL_COPY_ATTEMPTS = 4
 
 
 class SourceBusyError(ValueError):
@@ -97,8 +103,125 @@ def _signature(path: Path) -> dict[str, Any]:
             "inode": stat.st_ino, "device": stat.st_dev, "prefix": prefix.hex()}
 
 
-def _assert_idle(source: Path, *, output: bool = False) -> None:
+def _live_wal(source: Path) -> Path | None:
+    wal = Path(str(source) + "-wal")
+    try:
+        return wal if wal.stat().st_size else None
+    except FileNotFoundError:
+        return None
+
+
+def _wal_checksum(data: bytes, endian: str, state: tuple[int, int] = (0, 0)) -> tuple[int, int]:
+    a, b = state
+    for x, y in struct.iter_unpack(endian + "II", data):
+        a = (a + x + b) & 0xFFFFFFFF
+        b = (b + y + a) & 0xFFFFFFFF
+    return a, b
+
+
+def _apply_wal(database: Path, wal: Path) -> dict[str, Any]:
+    """Replay committed WAL frames into a private copy of the database.
+
+    Follows SQLite's own recovery rule: frames are read until the first salt
+    mismatch, bad checksum or short frame, and only frames up to the last
+    commit record are applied. SQLCipher checksums the encrypted page bytes,
+    so this works on the still-encrypted copy. Never touches WeChat's files.
+    """
+    info = {"wal_bytes": wal.stat().st_size, "committed_frames": 0, "applied_pages": 0}
+    with wal.open("rb") as stream:
+        header = stream.read(WAL_HEADER_SIZE)
+        if len(header) < WAL_HEADER_SIZE:
+            raise SourceBusyError("WAL header is incomplete; WeChat may be writing, retry in a moment")
+        magic, version, page_size = struct.unpack(">III", header[:12])
+        endian = WAL_MAGICS.get(magic)
+        if endian is None or version != WAL_VERSION:
+            raise SourceBusyError("unrecognized WAL header; fully quit WeChat and retry, do not delete its WAL files")
+        with database.open("rb") as db_stream:
+            db_head = db_stream.read(18)
+        if db_head[:16] == SQLITE_HEADER:
+            expected = int.from_bytes(db_head[16:18], "big")
+            expected = 65536 if expected == 1 else expected
+        else:
+            expected = PAGE_SIZE
+        if page_size != expected:
+            raise ValueError(f"WAL page size {page_size} does not match database page size {expected}")
+        state = _wal_checksum(header[:24], endian)
+        if state != struct.unpack(">II", header[24:32]):
+            raise SourceBusyError("WAL header checksum mismatch; retry in a moment")
+        salt = header[16:24]
+        pending: dict[int, int] = {}
+        committed: dict[int, int] = {}
+        db_pages: int | None = None
+        frames = 0
+        while True:
+            offset = stream.tell()
+            frame_header = stream.read(WAL_FRAME_HEADER_SIZE)
+            page = stream.read(page_size)
+            if len(frame_header) < WAL_FRAME_HEADER_SIZE or len(page) < page_size:
+                break
+            if frame_header[8:16] != salt:
+                break  # leftover frames from a previous WAL generation
+            state = _wal_checksum(page, endian, _wal_checksum(frame_header[:8], endian, state))
+            if state != struct.unpack(">II", frame_header[16:24]):
+                break  # torn or half-written frame ends the valid log, as in SQLite
+            pgno, commit_size = struct.unpack(">II", frame_header[:8])
+            if pgno == 0:
+                break
+            frames += 1
+            pending[pgno] = offset + WAL_FRAME_HEADER_SIZE
+            if commit_size:
+                committed.update(pending)
+                pending.clear()
+                db_pages = commit_size
+                info["committed_frames"] = frames
+        if db_pages is None:
+            return info
+        committed = {pgno: at for pgno, at in committed.items() if pgno <= db_pages}
+        existing = database.stat().st_size // page_size
+        missing = [pgno for pgno in range(existing + 1, db_pages + 1) if pgno not in committed]
+        if missing:
+            raise SourceBusyError("WAL commit is missing database extension pages; retry in a moment")
+        with database.open("r+b") as target:
+            target.truncate(db_pages * page_size)
+            for pgno, at in sorted(committed.items()):
+                stream.seek(at)
+                target.seek((pgno - 1) * page_size)
+                target.write(stream.read(page_size))
+        info["applied_pages"] = len(committed)
+        info["database_pages"] = db_pages
+    return info
+
+
+def _wal_snapshot(source: Path, work: Path) -> tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Copy database + WAL as one consistent point in time, then replay the WAL.
+
+    On APFS the copies are clones, so the window in which WeChat could write
+    between the two copies is tiny; signatures before and after must match.
+    """
+    database_copy, wal_copy = work / "database.enc", work / "database.enc-wal"
+    for attempt in range(WAL_COPY_ATTEMPTS):
+        wal = _live_wal(source)  # a checkpoint may have emptied it meanwhile
+        try:
+            before = (_signature(source), _signature(wal) if wal else None)
+            shutil.copyfile(source, database_copy)
+            if wal:
+                shutil.copyfile(wal, wal_copy)
+            after_wal = _live_wal(source)
+            after = (_signature(source), _signature(after_wal) if after_wal else None)
+        except FileNotFoundError:
+            before, after = (None, None), None
+        if before == after:
+            info = _apply_wal(database_copy, wal_copy) if wal else {"wal_bytes": 0}
+            wal_copy.unlink(missing_ok=True)
+            return database_copy, before[0], before[1], info
+        time.sleep(0.15 * (attempt + 1))
+    raise SourceBusyError("database kept changing while copying its WAL snapshot; retry in a moment")
+
+
+def _assert_idle(source: Path, *, output: bool = False, allow_wal: bool = False) -> None:
     for suffix in ("-wal", "-journal"):
+        if suffix == "-wal" and allow_wal:
+            continue
         sidecar = Path(str(source) + suffix)
         if sidecar.exists() and sidecar.stat().st_size:
             if suffix == "-journal":
@@ -187,10 +310,12 @@ def sync_databases(
     force: bool = False, dry_run: bool = False,
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """Refresh changed files only. Requires a stable, checkpointed source.
+    """Refresh changed files only; WeChat may keep running.
 
-    This is file-level incremental sync, not page/WAL replay. Source metadata,
-    key fingerprint and destination metadata must all match to skip a file.
+    A database with a live WAL is snapshotted together with its WAL into a
+    private temporary copy, and committed WAL frames are replayed there before
+    decryption. Source files are only ever read. Source metadata (database and
+    WAL), key fingerprint and destination metadata must all match to skip a file.
     """
     started = time.perf_counter()
     if profile not in ("chat", "media", "all"):
@@ -212,7 +337,7 @@ def sync_databases(
     result: dict[str, Any] = {
         "source": str(db_root), "output": str(out_root), "profile": profile, "dry_run": dry_run,
         "decrypted": [], "unchanged": [], "planned": [], "deferred": [],
-        "skipped_no_key": [], "failed": [], "bytes_processed": 0, "bytes_planned": 0,
+        "skipped_no_key": [], "failed": [], "wal_replayed": [], "bytes_processed": 0, "bytes_planned": 0,
     }
     with nullcontext() if dry_run else _sync_lock(out_root):
         manifest_path = out_root / ".sync-manifest.json"
@@ -233,9 +358,11 @@ def sync_databases(
                 destination = out_root / rel
                 if not source.resolve().is_relative_to(db_root) or not destination.resolve().is_relative_to(out_root):
                     raise ValueError("database symlink escapes source/output directory")
-                _assert_idle(source)
+                _assert_idle(source, allow_wal=True)  # a hot rollback journal still blocks
                 _assert_idle(destination, output=True)
+                wal = _live_wal(source)
                 signature = _signature(source)
+                wal_signature = _signature(wal) if wal else None
                 plain = signature["prefix"] == SQLITE_HEADER.hex()
                 key_hex = _key_for(rel, keys)
                 if not key_hex and not plain:
@@ -247,12 +374,14 @@ def sync_databases(
                 fingerprint = hashlib.sha256(key).hexdigest()
                 old = manifest["files"].get(name, {})
                 if (not force and isinstance(old, dict) and old.get("source") == signature
+                        and old.get("wal") == wal_signature
                         and old.get("key_fingerprint") == fingerprint and destination.is_file()
                         and old.get("output") == _signature(destination)):
-                    _assert_idle(source)
+                    _assert_idle(source, allow_wal=wal is not None)
                     _assert_idle(destination, output=True)
-                    if signature != _signature(source):
-                        raise SourceBusyError("source changed during sync; fully quit WeChat and retry")
+                    current_wal = _live_wal(source)
+                    if signature != _signature(source) or wal_signature != (_signature(current_wal) if current_wal else None):
+                        raise SourceBusyError("source changed during sync; retry in a moment")
                     result["unchanged"].append(name)
                     continue
                 result["bytes_planned"] += signature["size"]
@@ -266,14 +395,23 @@ def sync_databases(
                 fd, temp_name = tempfile.mkstemp(prefix=".decrypt-", suffix=".tmp", dir=destination.parent)
                 os.close(fd)
                 temporary = Path(temp_name)
-                _decrypt_file(source, temporary, key)
-                _verify_sqlite(temporary)
-                _assert_idle(source)
-                _assert_idle(destination, output=True)
-                if signature != _signature(source):
-                    raise SourceBusyError("source changed during sync; fully quit WeChat and retry")
+                if wal is None:
+                    _decrypt_file(source, temporary, key)
+                    _verify_sqlite(temporary)
+                    _assert_idle(source)
+                    _assert_idle(destination, output=True)
+                    if signature != _signature(source):
+                        raise SourceBusyError("source changed during sync; retry in a moment")
+                else:
+                    with tempfile.TemporaryDirectory(prefix=".wal-", dir=destination.parent) as work:
+                        snapshot, signature, wal_signature, wal_info = _wal_snapshot(source, Path(work))
+                        _decrypt_file(snapshot, temporary, key)
+                    _verify_sqlite(temporary)
+                    _assert_idle(destination, output=True)
+                    result["wal_replayed"].append({"file": name, **wal_info})
                 temporary.replace(destination)
-                manifest["files"][name] = {"source": signature, "key_fingerprint": fingerprint,
+                manifest["files"][name] = {"source": signature, "wal": wal_signature,
+                                           "key_fingerprint": fingerprint,
                                            "output": _signature(destination)}
                 result["decrypted"].append(name)
                 result["bytes_processed"] += signature["size"]

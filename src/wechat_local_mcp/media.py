@@ -18,7 +18,8 @@ import tempfile
 from typing import Any, Iterator
 import wave
 
-from .config import account_dir, container_dir, decrypted_dir, media_text_dir
+from .config import account_dir, container_dir, decrypted_dir, image_key_file, media_image_dir, media_text_dir
+from .images import ImageDecoder
 from .store import ChatStore, split_type, table_for
 
 
@@ -229,35 +230,45 @@ def _sticker_caption(snapshot: Path, md5: str) -> str:
     return ""
 
 
+def _voice_databases(snapshot: Path) -> list[Path]:
+    """WeChat shards voice into media_0.db, media_1.db, ... like message_N.db."""
+    return sorted(
+        (snapshot / "message").glob("media_[0-9]*.db"),
+        key=lambda path: int(path.stem.split("_")[-1]),
+    ) if (snapshot / "message").is_dir() else []
+
+
 def _voice_blob(
     snapshot: Path,
     chat_username: str,
     local_id: int,
     timestamp: int,
 ) -> bytes | None:
-    path = snapshot / "message/media_0.db"
-    if not path.is_file():
-        return None
-    with _read_only_connect(path) as connection:
-        name = connection.execute(
-            "SELECT rowid FROM Name2Id WHERE user_name = ?",
-            (chat_username,),
-        ).fetchone()
-        if name is None:
-            return None
-        rows = connection.execute(
-            """
-            SELECT voice_data
-            FROM VoiceInfo
-            WHERE chat_name_id = ? AND local_id = ? AND create_time = ?
-              AND length(voice_data) > 0
-            ORDER BY length(voice_data) DESC
-            """,
-            (int(name["rowid"]), local_id, timestamp),
-        ).fetchall()
-    if not rows:
-        return None
-    return bytes(rows[0]["voice_data"])
+    for path in reversed(_voice_databases(snapshot)):
+        try:
+            with _read_only_connect(path) as connection:
+                name = connection.execute(
+                    "SELECT rowid FROM Name2Id WHERE user_name = ?",
+                    (chat_username,),
+                ).fetchone()
+                if name is None:
+                    continue
+                row = connection.execute(
+                    """
+                    SELECT voice_data
+                    FROM VoiceInfo
+                    WHERE chat_name_id = ? AND local_id = ? AND create_time = ?
+                      AND length(voice_data) > 0
+                    ORDER BY length(voice_data) DESC
+                    LIMIT 1
+                    """,
+                    (int(name["rowid"]), local_id, timestamp),
+                ).fetchone()
+        except sqlite3.Error:
+            continue
+        if row is not None:
+            return bytes(row["voice_data"])
+    return None
 
 
 @contextmanager
@@ -398,22 +409,31 @@ class MediaTextExtractor:
         snapshot: Path | None = None,
         account: Path | None = None,
         cache: Path | None = None,
+        image_cache: Path | None = None,
     ):
         self.snapshot = (snapshot or decrypted_dir()).expanduser().resolve()
         self.account = account or account_dir(container_dir())
         self.cache = (cache or media_text_dir()).expanduser().resolve()
         self.store = ChatStore(self.snapshot)
+        self.images = ImageDecoder(
+            self.account,
+            image_cache or media_image_dir(),
+            image_key_file() if image_cache is None else None,
+        )
 
     def status(self) -> dict[str, Any]:
-        voice_database = self.snapshot / "message/media_0.db"
+        voice_databases = _voice_databases(self.snapshot)
         voice_count = 0
-        if voice_database.is_file():
-            with _read_only_connect(voice_database) as connection:
-                row = connection.execute(
-                    "SELECT count(*) AS count FROM VoiceInfo "
-                    "WHERE length(voice_data) > 0"
-                ).fetchone()
-                voice_count = int(row["count"]) if row else 0
+        for voice_database in voice_databases:
+            try:
+                with _read_only_connect(voice_database) as connection:
+                    row = connection.execute(
+                        "SELECT count(*) AS count FROM VoiceInfo "
+                        "WHERE length(voice_data) > 0"
+                    ).fetchone()
+                    voice_count += int(row["count"]) if row else 0
+            except sqlite3.Error:
+                continue
         cached_count = (
             sum(1 for _ in self.cache.glob("*.json"))
             if self.cache.is_dir()
@@ -423,11 +443,12 @@ class MediaTextExtractor:
             "ready": self.store.ready(),
             "snapshot": str(self.snapshot),
             "account_dir": str(self.account) if self.account else None,
-            "voice_database": str(voice_database),
+            "voice_databases": [str(path) for path in voice_databases],
             "voice_messages_available": voice_count,
             "image_cache_available": bool(
                 self.account and (self.account / "cache").is_dir()
             ),
+            "image_attachments": self.images.status(),
             "pilk_installed": _has_module("pilk"),
             "mlx_whisper_installed": (
                 _has_module("mlx_whisper")
@@ -449,7 +470,9 @@ class MediaTextExtractor:
             "privacy": {
                 "audio_uploaded": False,
                 "images_uploaded": False,
+                "image_key_source": "derived from local file names and verified on real thumbnails; never read from process memory",
                 "derived_text_cache": str(self.cache),
+                "decoded_image_cache": str(self.images.cache),
             },
         }
 
@@ -478,7 +501,7 @@ class MediaTextExtractor:
                 f"{sys.platform}:{platform.machine()}"
             )
         elif kind == "image":
-            engine_key = f"ocr:{sys.platform}:screenshot-v1"
+            engine_key = f"ocr:{sys.platform}:screenshot-v2"
         else:
             engine_key = f"sticker:{sys.platform}:caption-v1"
         key = _cache_key(
@@ -507,15 +530,26 @@ class MediaTextExtractor:
             if kind == "image":
                 if self.account is None:
                     raise RuntimeError("未找到本机微信账号缓存目录。")
-                candidates = _image_candidates(
+                candidates = []
+                decode_error = None
+                try:
+                    decoded = self.images.decode(
+                        username,
+                        timestamp,
+                        (message.get("image") or {}).get("file_id"),
+                    )
+                    candidates.append(Path(decoded["path"]))
+                except RuntimeError as exc:
+                    decode_error = exc
+                candidates.extend(_image_candidates(
                     self.account,
                     username,
                     local_id,
                     timestamp,
-                )
+                ))
                 if not candidates:
                     raise RuntimeError(
-                        "本地没有该图片缓存。请在微信中打开一次原图后重试。"
+                        f"本地没有该图片缓存：{decode_error or '请在微信中打开一次原图后重试。'}"
                     )
                 derived = None
                 selected = None
@@ -669,6 +703,46 @@ class MediaTextExtractor:
                     item["content_source"] = "sticker_recognition"
             enriched.append(item)
         return enriched
+
+    def decode_images(
+        self,
+        *,
+        chat: str,
+        start_ts: int | None,
+        end_ts: int | None,
+        limit: int,
+        offset: int,
+        sender: str | None = None,
+        quality: str = "full",
+    ) -> dict[str, Any]:
+        """Decode image messages of one chat to local files, newest first."""
+
+        page = self.store.media_messages(
+            chat, {"image"}, start_ts, end_ts, limit, offset, sender=sender
+        )
+        items: list[dict[str, Any]] = []
+        for message in page["items"]:
+            item = {
+                key: message.get(key)
+                for key in ("local_id", "sender", "sender_username", "timestamp", "time")
+            }
+            try:
+                decoded = self.images.decode(
+                    str(page["chat"]["username"]),
+                    int(message["timestamp"]),
+                    (message.get("image") or {}).get("file_id"),
+                    quality=quality,
+                )
+                item |= {"status": "ok", **decoded}
+            except RuntimeError as exc:
+                item |= {"status": "unavailable", "error": str(exc)}
+            items.append(item)
+        return {
+            **{key: value for key, value in page.items() if key not in ("items", "media_types")},
+            "items": items,
+            "decoded": sum(item["status"] == "ok" for item in items),
+            "local_only": True,
+        }
 
     def extract(
         self,

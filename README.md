@@ -10,7 +10,7 @@
 
 请让 Agent 先读 [INSTALL.md：安装、验证与排障](INSTALL.md)。它可以从全新克隆开始，生成适合当前电脑的配置，并自动验证 MCP 握手。Claude Code、Codex 以及支持 stdio 的客户端均可接入。
 
-**v0.5.0：默认轻量安装；默认只同步聊天必需库；未变化文件直接跳过；中断可续；每次同步返回耗时和处理量。** 第一次大数据库仍需解密；这是文件级增量，不是实时监听或 WAL 重放。详见 [性能说明与可复现测试](PERFORMANCE.md)。
+**v0.5.0：默认轻量安装；默认只同步聊天必需库；未变化文件直接跳过；中断可续；每次同步返回耗时和处理量。** 第一次大数据库仍需解密；之后按文件增量。微信可以保持运行：带 WAL 的库会和 WAL 一起复制到临时副本，回放已提交的写入后再解密，源文件只读。详见 [性能说明与可复现测试](PERFORMANCE.md)。
 
 MCP 接通不等于完整历史已就绪：精确历史需要你自己的密钥或明文快照；没有密钥可先使用可选的窗口 OCR。Windows 暂不提供自动密钥捕获，微信版本升级也可能影响兼容性。
 
@@ -18,7 +18,7 @@ MCP 接通不等于完整历史已就绪：精确历史需要你自己的密钥�
 
 1. 精确历史层：把已获得密钥的本地数据库解密成独立快照，再进行全文搜索和待办提取。
 2. 跨版本 UI 层：在数据库适配失效或尚无密钥时，用 macOS Vision 或 Windows.Media.Ocr 读取当前微信窗口。
-3. 媒体理解层：图片/截图使用本机 OCR；表情包读取消息说明和本地表情库；语音从 `media_0.db` 读取微信 SILK 并在本机转写；合并转发消息解压为分层 JSON。
+3. 媒体理解层：图片/截图使用本机 OCR；表情包读取消息说明和本地表情库；图片附件（`msg/attach` 下的 V1/V2 `.dat`、wxgf）用本地派生并校验过的密钥解码，可直接把图交给模型看；语音从 `media_*.db` 读取微信 SILK 并在本机转写；合并转发消息解压为分层 JSON。
 4. MCP 查询层：默认返回 JSON，不向微信发消息、不修改微信数据库。
 
 这样微信升级时，只需要替换准备层；`wechat_list_chats`、`wechat_search_messages`、`wechat_find_todos` 等工具不需要跟着重写。
@@ -138,7 +138,7 @@ zsh scripts/prepare_capture_copy.sh
 
 ## 解密本地快照
 
-先完全退出微信，再执行（Windows 将 `.venv/bin/python` 换成 `.venv\Scripts\python.exe`）：
+微信可以保持运行（Windows 将 `.venv/bin/python` 换成 `.venv\Scripts\python.exe`）：
 
 ```bash
 .venv/bin/python -m wechat_local_mcp.cli sync --dry-run
@@ -151,7 +151,7 @@ zsh scripts/prepare_capture_copy.sh
 
 默认 `--profile chat` 只处理 `contact/contact.db` 和 `message/message_<数字>.db`。需要语音/表情时用 `--profile media`，所有数据库用 `--profile all`。未变化文件会跳过；`--force` 强制重建。进度写到 stderr，stdout 始终是 JSON；非完整同步退出码为 2。不要因看到 `count=0` 就认为失败：查看 `unchanged_count` 和 `complete`。
 
-如有多个账号，CLI 用 `--db-dir /实际账号/db_storage --out /该账号专用快照目录` 明确选择。快照目录不要混用不同账号。存在非空 WAL/journal 时会保留旧快照并提示退出微信，绝不删除微信日志。首次升级会重建一次缓存清单。
+如有多个账号，CLI 用 `--db-dir /实际账号/db_storage --out /该账号专用快照目录` 明确选择。快照目录不要混用不同账号。存在 WAL 时只读复制数据库和 WAL 到临时目录并回放已提交的帧（与 SQLite 自身恢复规则一致：遇到 salt 不符、校验失败或半写帧即停止），绝不修改或删除微信日志；若复制期间微信持续写入或存在未提交的回滚日志，会保留旧快照并返回 `source_busy`，稍后重试即可。首次升级会重建一次缓存清单。
 
 也可以通过环境变量覆盖：
 
@@ -226,7 +226,9 @@ Windows PowerShell 示例：
 - `wechat_recent_messages`：汇总最近消息，并自动转换其中的图片、截图、表情包和语音。
 - `wechat_find_todos`：用可解释的中英文行动项启发式找待办候选。
 - `wechat_chat_summary`：自动转换媒体后返回参与者统计、待办候选和消息。
-- `wechat_media_status`：检查图片/表情缓存、本机 OCR、SILK 解码和离线 Whisper 是否就绪。
+- `wechat_media_status`：检查图片/表情缓存、图片密钥、ffmpeg、本机 OCR、SILK 解码和离线 Whisper 是否就绪。
+- `wechat_view_images`：解码指定聊天的图片附件，直接以图片内容返回给模型查看，可按时间段和发送者筛选。
+- `wechat_export_images`：把指定聊天的图片解码后导出到一个文件夹（如 Obsidian 附件目录）。
 - `wechat_ui_diagnose`：诊断屏幕录制/OCR 只读兜底。
 - `wechat_list_recent_chats`：数据库快照不可用时读取当前窗口可见会话。
 - `wechat_read_chat_ui`：数据库快照不可用时用本机 OCR 读取聊天。
@@ -268,7 +270,7 @@ uv sync --locked --inexact --extra ui --extra media --python 3.12
 
 类型 19 的合并转发/压缩聊天会返回 `forwarded.items` 数组。每个子项带 `data_type`、`kind`、`sender`、`time`、`content`，以及可用的媒体摘要；支持文本、图片、语音、视频、文件、链接、位置、嵌套聊天、表情包、小程序和视频号等类型。最多展开 200 条，超出时设置 `truncated=true`。
 
-图片优先读取微信本机的高清/中图缓存，找不到时使用缩略图。若结果提示图片未缓存，请先在微信中打开一次原图。Apple Silicon macOS 默认使用 MLX Whisper；Windows、Linux 和 Intel macOS 使用 faster-whisper。可设置：
+图片优先解码 `msg/attach/<会话>/<年-月>/Img/` 下的高清图（`_h.dat`）、原图（`.dat`），再退到缩略图（`_t.dat`）和明文缓存。V2 图片密钥按 `md5(code + wxid)[:16]` 派生，`code` 取自微信本地缓存文件名（kvcomm、`ConfSDK/netbridge/<code>.ini`），每个候选都要能解开真实缩略图才会被采用；不读进程内存、不联网。验证通过的密钥缓存到 `keys.json` 旁的 `image_key.json`（0600），每次使用前再用最新缩略图校验。解码后的图片缓存在 `wechat-local-vault/media-images/`（目录 0700、文件 0600）。wxgf（HEVC）格式需要本机 `ffmpeg`。只有缩略图时说明原图没在电脑微信里打开过。也可用 `WECHAT_IMAGE_AES_KEY` + `WECHAT_IMAGE_XOR_KEY` 手动提供密钥。Apple Silicon macOS 默认使用 MLX Whisper；Windows、Linux 和 Intel macOS 使用 faster-whisper。可设置：
 
 ```bash
 export WECHAT_WHISPER_MODEL=mlx-community/whisper-small-mlx

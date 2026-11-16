@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import io
+import json
 import logging
+import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult, ImageContent, TextContent
 
 from .config import (
     account_dir,
@@ -382,7 +388,7 @@ def wechat_find_todos_ui(chat: str, limit: int = 80, scroll_pages: int = 3, min_
 @mcp.tool(
     name="wechat_sync",
     title="同步本地微信数据库快照",
-    description="增量同步本机数据库到独立快照。默认 profile=chat 仅解密联系人和消息；media 加上语音/表情库；all 解密所有库。跳过未变化文件。dry_run=true 预估工作量，force=true 强制重建。必须先完全退出微信；不会修改源文件或发送消息。",
+    description="增量同步本机数据库到独立快照。默认 profile=chat 仅解密联系人和消息；media 加上语音/表情库；all 解密所有库。跳过未变化文件。dry_run=true 预估工作量，force=true 强制重建。微信可以保持运行：带 WAL 的库会连同 WAL 一起复制到临时副本并回放已提交的写入；只读源文件，不会修改源文件或发送消息。",
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 def wechat_sync(
@@ -410,7 +416,7 @@ def wechat_sync(
     result["snapshot_available"] = (target_dir / "contact/contact.db").exists() and bool(list((target_dir / "message").glob("message_*.db")))
     result["ready"] = result["snapshot_available"] and result["complete"] and not dry_run
     if any(item["code"] == "source_busy" for item in result["failed"]):
-        result["next_step"] = "完全退出微信后重试；不要删除微信的 WAL 文件。旧快照可能仍可查询，但本次未完整更新。"
+        result["next_step"] = "微信正在频繁写入或存在未提交的回滚日志，稍后重试；仍失败再完全退出微信。不要删除微信的 WAL 文件。旧快照仍可查询。"
     return output(result, "json")
 
 
@@ -541,6 +547,122 @@ def wechat_recent_messages(chats: list[str] | None = None, limit: int = 50, resp
     return output(
         _with_automatic_media(_store().recent(chats, limit), "items"),
         response_format,
+    )
+
+
+IMAGE_QUALITIES = {"full", "thumb"}
+
+
+def _image_payload(path: Path, max_side: int) -> tuple[bytes, str]:
+    """Downscale for the model; GIFs keep their first frame."""
+    try:
+        from PIL import Image
+    except ImportError:
+        data = path.read_bytes()
+        mime = {".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}.get(path.suffix.lower(), "image/jpeg")
+        return data, mime
+    with Image.open(path) as image:
+        image.seek(0)
+        frame = image.convert("RGB")
+        frame.thumbnail((max_side, max_side))
+        buffer = io.BytesIO()
+        frame.save(buffer, format="JPEG", quality=85, optimize=True)
+    return buffer.getvalue(), "image/jpeg"
+
+
+@mcp.tool(
+    name="wechat_view_images",
+    title="查看微信聊天里的图片",
+    description=(
+        "解出指定聊天里的图片附件（本机 msg/attach 下的 .dat，V1/V2/旧版 XOR 与 wxgf），"
+        "直接以图片内容返回给模型查看，并附发送者、时间和本地路径。默认最新优先，"
+        "可按时间段和发送者（昵称/备注/微信ID 片段）筛选。图片密钥由本机 kvcomm 缓存文件名派生"
+        "并用真实缩略图校验，不读进程内存、不联网、不落盘。quality=full 优先高清/原图，thumb 只取缩略图。"
+    ),
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def wechat_view_images(
+    chat: str,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    sender: str | None = None,
+    limit: int = 6,
+    offset: int = 0,
+    quality: str = "full",
+    max_side: int = 1280,
+) -> CallToolResult:
+    if not 1 <= limit <= 20 or offset < 0:
+        raise ValueError("limit must be 1-20 and offset must be >= 0")
+    if quality not in IMAGE_QUALITIES:
+        raise ValueError("quality must be 'full' or 'thumb'")
+    if not 256 <= max_side <= 2048:
+        raise ValueError("max_side must be 256-2048")
+    data = _media().decode_images(
+        chat=chat, start_ts=_ts(start_time), end_ts=_ts(end_time),
+        limit=limit, offset=offset, sender=sender, quality=quality,
+    )
+    content: list[TextContent | ImageContent] = [
+        TextContent(type="text", text=json.dumps(data, ensure_ascii=False, indent=2, default=str))
+    ]
+    for index, item in enumerate(data["items"], 1):
+        if item.get("status") != "ok":
+            continue
+        try:
+            payload, mime = _image_payload(Path(item["path"]), max_side)
+        except OSError as exc:
+            item["status"], item["error"] = "unavailable", f"图片已解码但无法读取：{exc}"
+            continue
+        caption = f"[{index}] {item.get('time', '')} {item.get('sender', '')} ({item.get('variant')})"
+        content.append(TextContent(type="text", text=caption))
+        content.append(ImageContent(type="image", data=base64.b64encode(payload).decode("ascii"), mimeType=mime))
+    return CallToolResult(content=content, structuredContent=data)
+
+
+@mcp.tool(
+    name="wechat_export_images",
+    title="导出微信聊天里的图片",
+    description=(
+        "把指定聊天的图片附件解码后复制到 output_dir（例如 Obsidian 附件文件夹），"
+        "文件名为 时间_发送者_local_id.扩展名；已存在的同名文件会跳过。只写入 output_dir，"
+        "不修改微信文件。筛选参数与 wechat_view_images 相同。"
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def wechat_export_images(
+    chat: str,
+    output_dir: str,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    sender: str | None = None,
+    limit: int = 100,
+    quality: str = "full",
+) -> JsonToolResult:
+    if not 1 <= limit <= 1000:
+        raise ValueError("limit must be 1-1000")
+    if quality not in IMAGE_QUALITIES:
+        raise ValueError("quality must be 'full' or 'thumb'")
+    target = Path(output_dir).expanduser()
+    target.mkdir(parents=True, exist_ok=True)
+    data = _media().decode_images(
+        chat=chat, start_ts=_ts(start_time), end_ts=_ts(end_time),
+        limit=limit, offset=0, sender=sender, quality=quality,
+    )
+    exported, skipped = [], []
+    for item in data["items"]:
+        if item.get("status") != "ok":
+            continue
+        stamp = datetime.fromtimestamp(int(item["timestamp"])).strftime("%Y%m%d_%H%M%S")
+        who = re.sub(r"[\\/:*?\"<>|\s]+", "_", str(item.get("sender") or "unknown"))[:40]
+        destination = target / f"{stamp}_{who}_{item['local_id']}{Path(item['path']).suffix}"
+        if destination.exists():
+            skipped.append(str(destination))
+            continue
+        shutil.copyfile(item["path"], destination)
+        exported.append(str(destination))
+        item["exported_to"] = str(destination)
+    return output(
+        data | {"output_dir": str(target), "exported": exported, "skipped_existing": skipped},
+        "json",
     )
 
 

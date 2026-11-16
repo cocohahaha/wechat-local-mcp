@@ -64,6 +64,24 @@ def media_text_dir() -> Path:
     ).expanduser()
 
 
+def image_key_file() -> Path:
+    """Verified image key cache; lives beside keys.json with the same 0600 protection."""
+
+    configured = os.environ.get("WECHAT_IMAGE_KEY_FILE")
+    if configured:
+        return Path(configured).expanduser()
+    return keys_file().parent / "image_key.json"
+
+
+def media_image_dir() -> Path:
+    """Return the local cache directory for decoded image attachments."""
+
+    configured = os.environ.get("WECHAT_MEDIA_IMAGE_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    return media_text_dir().parent / "media-images"
+
+
 def whisper_model() -> str:
     """Return the local MLX Whisper model identifier used for voice messages."""
 

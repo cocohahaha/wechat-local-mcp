@@ -14,6 +14,10 @@ from Vision import (
 from .models import OcrBlock
 
 
+def _unit(value: float) -> float:
+    return min(max(float(value), 0.0), 1.0)
+
+
 def recognize_text(image_path: Path) -> list[OcrBlock]:
     """Recognize Simplified Chinese and English text in a local image."""
 
@@ -39,14 +43,17 @@ def recognize_text(image_path: Path) -> list[OcrBlock]:
         if not text:
             continue
         bounds = observation.boundingBox()
+        # Vision returns normalized coordinates with float noise such as -7e-09.
+        x = _unit(bounds.origin.x)
+        y = _unit(bounds.origin.y)
         blocks.append(
             OcrBlock(
                 text=text,
-                confidence=float(candidate.confidence()),
-                x=float(bounds.origin.x),
-                y=float(bounds.origin.y),
-                width=float(bounds.size.width),
-                height=float(bounds.size.height),
+                confidence=_unit(candidate.confidence()),
+                x=x,
+                y=y,
+                width=min(_unit(bounds.size.width), 1.0 - x),
+                height=min(_unit(bounds.size.height), 1.0 - y),
             )
         )
 

@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Iterable
 from xml.etree import ElementTree as ET
 
+from .images import file_id_from_packed
+
 try:
     import zstandard as zstd
 except Exception:  # optional for unusual compressed rows
@@ -455,6 +457,9 @@ def _row_message(row: sqlite3.Row, chat: dict[str, Any], contacts: dict[str, str
         "content": _format_content(row["local_type"], content), "reply_to": _reply(content, row["local_type"], contacts),
         "mentions": mentions, "compressed": bool(row["flag"] == 4),
     }
+    if base_type == 3:
+        packed = row["packed_info_data"] if "packed_info_data" in row.keys() else None
+        result["image"] = {"file_id": file_id_from_packed(packed)}
     if base_type == 47 and details:
         result["sticker"] = details
     elif base_type == 49 and details:
@@ -520,7 +525,7 @@ class ChatStore:
                     required = {"local_id", "local_type", "real_sender_id", "create_time", "message_content"}
                     if not required.issubset(cols):
                         continue
-                    selected = ["local_id", "local_type", "real_sender_id", "create_time", "message_content", "compress_content" if "compress_content" in cols else "NULL AS compress_content", "WCDB_CT_message_content AS flag" if "WCDB_CT_message_content" in cols else "NULL AS flag", "source" if "source" in cols else "NULL AS source"]
+                    selected = ["local_id", "local_type", "real_sender_id", "create_time", "message_content", "compress_content" if "compress_content" in cols else "NULL AS compress_content", "WCDB_CT_message_content AS flag" if "WCDB_CT_message_content" in cols else "NULL AS flag", "source" if "source" in cols else "NULL AS source", "packed_info_data" if "packed_info_data" in cols else "NULL AS packed_info_data"]
                     where, params = [], []
                     if start_ts is not None:
                         where.append("create_time >= ?"); params.append(start_ts)
@@ -572,6 +577,7 @@ class ChatStore:
                             "compress_content" if "compress_content" in cols else "NULL AS compress_content",
                             "WCDB_CT_message_content AS flag" if "WCDB_CT_message_content" in cols else "NULL AS flag",
                             "source" if "source" in cols else "NULL AS source",
+                            "packed_info_data" if "packed_info_data" in cols else "NULL AS packed_info_data",
                         ]
                         where, params = [], []
                         if start_ts is not None:
@@ -613,8 +619,9 @@ class ChatStore:
         end_ts: int | None = None,
         limit: int = 20,
         offset: int = 0,
+        sender: str | None = None,
     ) -> dict[str, Any]:
-        """List image, voice, and sticker messages without loading unrelated bodies."""
+        """List image, voice, and sticker messages, newest first across all DB shards."""
 
         type_numbers = {
             "image": 3,
@@ -623,24 +630,20 @@ class ChatStore:
         }
         allowed = {type_numbers[name] for name in media_types}
         resolved = self.resolve(chat)
-        items: list[dict[str, Any]] = []
-        total = 0
-        for row, _, names in self._iter_rows(
-            resolved["username"],
-            start_ts,
-            end_ts,
-            newest_first=True,
-        ):
+        sender_key = (sender or "").casefold().strip()
+        matches: list[dict[str, Any]] = []
+        for row, _, names in self._iter_rows(resolved["username"], start_ts, end_ts):
             base_type, _ = split_type(row["local_type"])
             if base_type not in allowed:
                 continue
-            if total >= offset and len(items) < limit:
-                item = _row_message(row, resolved, self.contacts, names)
-                item["media_kind"] = {
-                    3: "image", 34: "voice", 47: "sticker"
-                }[base_type]
-                items.append(item)
-            total += 1
+            item = _row_message(row, resolved, self.contacts, names)
+            if sender_key and sender_key not in f"{item['sender']} {item['sender_username']}".casefold():
+                continue
+            item["media_kind"] = {3: "image", 34: "voice", 47: "sticker"}[base_type]
+            matches.append(item)
+        matches.sort(key=lambda item: (item["timestamp"], int(item["local_id"] or 0)), reverse=True)
+        total = len(matches)
+        items = matches[offset:offset + limit]
         return {
             "chat": resolved,
             "media_types": sorted(media_types),

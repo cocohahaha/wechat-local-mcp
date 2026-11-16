@@ -26,3 +26,10 @@ Design research also reviewed
 [BiboyQG/WeChat-MCP](https://github.com/BiboyQG/WeChat-MCP), an MIT-licensed
 Accessibility-based WeChat MCP server. No message-sending, contact-adding, or
 Moments-publishing code is included here.
+
+Image attachment decoding (`images.py`) is an independent implementation. The
+V2 `.dat` layout and the local image-key derivation
+(`md5(code + wxid)[:16]`, verified against real V2 thumbnails) follow the
+approach documented by the WeChatDataAnalysis and WeFlow projects; no code
+from those projects is included. WAL replay in `crypto.py` follows the public
+SQLite WAL file format specification.

@@ -9,6 +9,7 @@ build/
 dist/
 *.egg-info/
 keys*.json
+image_key*.json
 *.db
 *.db-shm
 *.db-wal
