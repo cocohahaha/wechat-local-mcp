@@ -104,3 +104,33 @@ def test_parses_zstd_forwarded_chat_history_as_structured_json(
     assert item["forwarded"]["items"][1]["kind"] == "image"
     assert "明天确认发布计划" in item["content"]
     assert ChatStore(root).search("发布计划")["count"] == 1
+
+
+def test_recent_chats_orders_by_latest_message_across_databases(tmp_path: Path) -> None:
+    root = make_fixture(tmp_path)
+    with sqlite3.connect(root / "contact/contact.db") as con:
+        con.execute("INSERT INTO contact VALUES ('team@chatroom', '项目群', '', '')")
+        con.execute("INSERT INTO contact VALUES ('wxid_silent', '没说过话', '', '')")
+    columns = "(local_id INTEGER, local_type INTEGER, real_sender_id INTEGER, create_time INTEGER, message_content TEXT, source TEXT)"
+    group = "Msg_" + md5(b"team@chatroom").hexdigest()
+    alice = "Msg_" + md5(b"wxid_alice").hexdigest()
+    with sqlite3.connect(root / "message/message_0.db") as con:
+        con.execute(f"CREATE TABLE [{group}] {columns}")
+        con.execute(f"INSERT INTO [{group}] VALUES (1, 1, 2, 1700000500, '周五交稿', '')")
+    # 同一个会话的较新消息落在另一个库文件里
+    with sqlite3.connect(root / "message/message_1.db") as con:
+        con.execute(f"CREATE TABLE [{alice}] {columns}")
+        con.execute(f"INSERT INTO [{alice}] VALUES (9, 1, 2, 1700000900, '报价已确认', '')")
+
+    store = ChatStore(root)
+    result = store.recent_chats()
+    assert [item["display_name"] for item in result["items"]] == ["Alice", "项目群"]
+    assert result["total"] == 2  # 没有消息的联系人不出现
+    assert result["items"][0]["last_timestamp"] == 1700000900
+    assert result["items"][0]["last_message"] == "报价已确认"
+    assert result["items"][1]["kind"] == "group"
+
+    page = store.recent_chats(limit=1, offset=1)
+    assert [item["username"] for item in page["items"]] == ["team@chatroom"]
+    assert page["has_more"] is False
+    assert [item["username"] for item in store.recent_chats(kind="contact")["items"]] == ["wxid_alice"]

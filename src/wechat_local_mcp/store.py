@@ -689,6 +689,63 @@ class ChatStore:
         candidates.sort(key=lambda x: (x["todo_score"], x["timestamp"]), reverse=True)
         return {"days": days, "count": min(len(candidates), limit), "items": candidates[:limit], "heuristic": True}
 
+    def recent_chats(self, limit: int = 50, offset: int = 0, kind: str = "all") -> dict[str, Any]:
+        """Chats ordered by their latest message, newest first.
+
+        Only the newest timestamp of every chat is read to build the order; the
+        last message itself is decoded for the returned page alone.
+        """
+        table_users = {table_for(username): username for username in self.contacts}
+        latest: dict[str, int] = {}
+        for path in _tables(self.root):
+            try:
+                with _connect(path) as con:
+                    names = [
+                        str(row[0])
+                        for row in con.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
+                        )
+                    ]
+                    for name in names:
+                        username = table_users.get(name)
+                        if username is None:
+                            continue
+                        is_group = "@chatroom" in username
+                        if (kind == "group" and not is_group) or (kind == "contact" and is_group):
+                            continue
+                        try:
+                            newest = con.execute(f"SELECT MAX(create_time) FROM [{name}]").fetchone()[0]
+                        except sqlite3.Error:
+                            continue
+                        if newest is not None and int(newest) > latest.get(username, -1):
+                            latest[username] = int(newest)
+            except sqlite3.Error:
+                continue
+        order = sorted(latest.items(), key=lambda pair: (-pair[1], pair[0]))
+        total = len(order)
+        items = []
+        for username, newest in order[offset:offset + limit]:
+            item: dict[str, Any] = {
+                "username": username,
+                "display_name": self.contacts.get(username, username),
+                "kind": "group" if "@chatroom" in username else "contact",
+                "last_timestamp": newest,
+                "last_time": datetime.fromtimestamp(newest).strftime("%Y-%m-%d %H:%M:%S"),
+                "last_sender": "",
+                "last_message": "",
+            }
+            rows = list(self._iter_many_rows([username], None, None, per_chat_limit=1, newest_first=True))
+            if rows:
+                row, chat, name_map = max(rows, key=lambda found: (found[0]["create_time"], found[0]["local_id"]))
+                message = _row_message(row, chat, self.contacts, name_map)
+                text = " ".join(str(message["content"] or "").split())
+                item["last_sender"] = message["sender"]
+                item["last_message"] = text if len(text) <= 120 else text[:120] + "…"
+            items.append(item)
+        end = offset + len(items)
+        return {"total": total, "count": len(items), "offset": offset, "items": items,
+                "has_more": end < total, "next_offset": end if end < total else None}
+
     def recent(self, chats: list[str] | None = None, limit: int = 50) -> dict[str, Any]:
         usernames = [self.resolve(x)["username"] for x in chats] if chats else list(self.contacts)
         items = []

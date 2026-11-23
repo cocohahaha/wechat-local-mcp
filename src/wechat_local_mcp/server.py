@@ -458,6 +458,34 @@ def wechat_list_chats(query: str = "", limit: int = 50, offset: int = 0, respons
 
 
 @mcp.tool(
+    name="wechat_recent_chats",
+    title="按最近消息列出微信会话",
+    description=(
+        "列出明文快照中有消息的会话，按最后一条消息的时间从新到旧排序，"
+        "附最后一条消息的时间、发送人和文字摘要；支持 offset/limit 分页，"
+        "kind 可取 all、group、contact。不做图片 OCR 和语音转写，所以很快。"
+    ),
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def wechat_recent_chats(limit: int = 50, offset: int = 0, kind: str = "all", response_format: str = "json") -> JsonToolResult:
+    if not 1 <= limit <= 500 or offset < 0:
+        raise ValueError("limit must be 1-500 and offset must be >= 0")
+    if kind not in {"all", "group", "contact"}:
+        raise ValueError("kind must be 'all', 'group' or 'contact'")
+    try:
+        return output(_store().recent_chats(limit, offset, kind), response_format)
+    except RuntimeError as exc:
+        return output(
+            {
+                "ready": False,
+                "error": str(exc),
+                "next_step": "先调用 wechat_status；快照未就绪时可以用 wechat_list_recent_chats 从微信窗口读取。",
+            },
+            "json",
+        )
+
+
+@mcp.tool(
     name="wechat_read_chat",
     title="读取微信聊天记录",
     description=(

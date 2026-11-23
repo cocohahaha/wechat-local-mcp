@@ -221,6 +221,7 @@ Windows PowerShell 示例：
 - `wechat_status`：检查微信版本、数据库、密钥与快照状态。
 - `wechat_sync`：按 keys.json 增量解密数据库到独立快照目录，支持 `profile` / `dry_run` / `force`。
 - `wechat_list_chats`：列出联系人和群聊，支持分页。
+- `wechat_recent_chats`：按最后一条消息的时间从新到旧列出会话，附最后一条消息的时间、发送人和摘要，支持分页和按群聊、联系人筛选。
 - `wechat_read_chat`：按昵称、备注、群名或微信 ID 读取消息，并自动理解图片、截图、表情包、语音及合并转发消息。
 - `wechat_search_messages`：按关键词、聊天和时间范围搜索普通消息及已自动转换的媒体文字。
 - `wechat_recent_messages`：汇总最近消息，并自动转换其中的图片、截图、表情包和语音。
